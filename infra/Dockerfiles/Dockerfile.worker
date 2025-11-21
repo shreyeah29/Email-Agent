@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+# Install system dependencies including Tesseract and Poppler
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    tesseract-ocr \
+    poppler-utils \
+    libtesseract-dev \
+    libleptonica-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Default command (can be overridden)
+CMD ["python", "services/extractor/worker.py"]
+

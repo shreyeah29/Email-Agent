@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: invoice_user
+          POSTGRES_PASSWORD: invoice_pass
+          POSTGRES_DB: invoices_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tesseract-ocr poppler-utils
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run migrations
+      env:
+        TEST_DATABASE_URL: postgresql://invoice_user:invoice_pass@localhost:5432/invoices_test
+      run: |
+        psql $TEST_DATABASE_URL -f migrations/001_create_core_tables.sql || true
+    
+    - name: Run tests
+      env:
+        TEST_DATABASE_URL: postgresql://invoice_user:invoice_pass@localhost:5432/invoices_test
+        DATABASE_URL: postgresql://invoice_user:invoice_pass@localhost:5432/invoices_test
+      run: |
+        pytest tests/ -v --cov=services --cov=shared
+

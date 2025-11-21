@@ -1,0 +1,19 @@
+{
+  "id": "sample_email_001",
+  "threadId": "thread_001",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "Invoice from ACME Supplies",
+  "payload": {
+    "mimeType": "multipart/mixed",
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "VGhpcyBpcyBhIHNhbXBsZSBpbnZvaWNlIGVtYWlsIGJvZHkuCkludm9pY2UgTnVtYmVyOiBJTlYtMjAyNS0xMjMK"
+        }
+      }
+    ]
+  },
+  "internalDate": "1735689600000"
+}
+
