@@ -1,10 +1,10 @@
 # Email Agent - Automated Invoice Processing System
 
-An automated system that reads shared inboxes (Gmail/Outlook), extracts invoice/receipt fields into flexible JSONB storage, reconciles vendors/projects, provides a review UI, and exposes APIs with a conversational agent.
+An automated system that reads Gmail inboxes, extracts invoice/receipt fields into flexible JSONB storage, reconciles vendors/projects, provides a review UI, and exposes APIs with a conversational agent.
 
 ## Features
 
-- 📧 **Email Ingestion**: Polls Gmail and Microsoft Outlook for new emails
+- 📧 **Email Ingestion**: Polls Gmail for new emails
 - 📄 **Document Processing**: Extracts text from PDFs (digital and scanned via OCR)
 - 🔍 **Field Extraction**: Extracts invoice fields (vendor, date, amount, line items) with confidence scores
 - 🔗 **Reconciliation**: Fuzzy matching to auto-match vendors and projects
@@ -17,8 +17,8 @@ An automated system that reads shared inboxes (Gmail/Outlook), extracts invoice/
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Gmail/    │────▶│  Ingestion   │────▶│    Redis    │
-│   Outlook   │     │   Service    │     │    Queue    │
+│    Gmail    │────▶│  Ingestion   │────▶│    Redis    │
+│             │     │   Service    │     │    Queue    │
 └─────────────┘     └──────────────┘     └─────────────┘
                                               │
                                               ▼
@@ -119,18 +119,6 @@ An automated system that reads shared inboxes (Gmail/Outlook), extracts invoice/
 6. Run ingestion service - it will open browser for OAuth flow
 7. Save the generated `token.json` for future use
 
-### Microsoft Outlook Setup
-
-1. Go to [Azure Portal](https://portal.azure.com/)
-2. Register a new application
-3. Create a client secret
-4. Set API permissions: `Mail.Read`
-5. Set in `.env`:
-   ```
-   MICROSOFT_CLIENT_ID=your_client_id
-   MICROSOFT_CLIENT_SECRET=your_client_secret
-   MICROSOFT_TENANT_ID=your_tenant_id
-   ```
 
 ## API Endpoints
 
@@ -307,7 +295,6 @@ See `.env.example` for all required environment variables:
 - `S3_ENDPOINT_URL` - S3 endpoint (MinIO for dev)
 - `S3_ACCESS_KEY` / `S3_SECRET_KEY` - S3 credentials
 - `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` - Gmail OAuth
-- `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` - Microsoft OAuth
 - `API_KEY` - API authentication key
 
 ## Acceptance Criteria
@@ -329,6 +316,113 @@ See `.env.example` for all required environment variables:
 - [ ] Multi-currency support with conversion
 - [ ] Advanced line item extraction
 - [ ] Email template detection
+
+## Review & Process Approved Emails
+
+The system includes a manual review interface that lets you select specific emails to process, ensuring only approved messages go through the extraction pipeline.
+
+### Features
+
+- **Gmail Integration**: Connect your Gmail account (one-time OAuth)
+- **Smart Candidate Search**: Find invoice-related emails using Gmail search queries
+- **Preview Before Processing**: See email metadata, subjects, and attachment info
+- **Selective Processing**: Choose exactly which emails to process
+- **Progress Tracking**: Monitor processing jobs in real-time
+- **Non-Destructive**: Only processes explicitly selected messages; optional labeling
+
+### How to Use
+
+#### 1. Access the Review Interface
+
+```bash
+# Start the Streamlit UI
+streamlit run services/ui/review_candidates.py
+```
+
+Or access via the main dashboard at `http://localhost:8501` and navigate to the "Review Candidates" page.
+
+#### 2. Connect Gmail
+
+On first use, the system will prompt for Gmail OAuth authentication. This is a one-time setup that reuses your existing Gmail token.
+
+**Environment Variable:**
+- `GMAIL_CLIENT_SECRETS_PATH`: Path to Gmail OAuth client secrets JSON file
+  - Default: `/mnt/data/client_secret_256579107172-41mnqgf7c0q5kp8ebbnluao73901g2ve.apps.googleusercontent.com.json`
+  - Or set `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET` in `.env`
+
+#### 3. Find Candidate Messages
+
+1. Enter a Gmail search query (or use presets):
+   - `has:attachment` - All emails with attachments
+   - `subject:invoice` - Emails with "invoice" in subject
+   - `subject:receipt` - Emails with "receipt" in subject
+   - `has:attachment subject:invoice` - Combined query
+
+2. Click **"Find Candidates"** to search your Gmail inbox
+
+3. Review the list of candidate messages with:
+   - Subject, From, Date
+   - Email snippet preview
+   - Attachment information
+
+#### 4. Select and Process
+
+1. **Select Messages**: Check the boxes next to emails you want to process
+   - Use "Select All" / "Deselect All" for bulk selection
+   - Preview individual messages before selecting
+
+2. **Process Selected**: Click **"Process Selected Messages"**
+   - Optionally enable "Apply 'ProcessedByAgent' label" to mark processed emails
+
+3. **Monitor Progress**: Watch real-time progress as messages are processed
+   - See job status updates
+   - View extracted invoice records
+   - Check confidence scores
+
+#### 5. View Results
+
+After processing completes:
+- **Summary**: Quick overview of extracted data
+- **Invoice Records**: Detailed vendor, date, amount, line items
+- **Confidence Scores**: Quality indicators for extracted data
+- **Provenance**: Links to stored raw email and extraction data
+
+### Safety Guarantees
+
+- **No Automatic Processing**: Only messages you explicitly select are processed
+- **Non-Destructive**: Emails are never deleted; optional labeling only
+- **Selective**: No inbox-wide scanning; only searches for candidates you request
+- **Reuses Existing Auth**: Uses your existing Gmail OAuth token; no separate authentication needed
+
+### API Endpoints
+
+The review interface uses these API endpoints:
+
+- `GET /candidates/messages?q=<query>&max=<number>` - Fetch candidate message previews
+- `POST /candidates/process` - Process selected message IDs
+  ```json
+  {
+    "message_ids": ["msg1", "msg2"],
+    "label_after": true
+  }
+  ```
+- `GET /candidates/process_status?job_id=<id>` - Get processing job status
+
+### Environment Variables
+
+Add to your `.env` file:
+
+```bash
+# Gmail OAuth (for review interface)
+GMAIL_CLIENT_SECRETS_PATH=/path/to/client_secret_*.json
+# OR
+GMAIL_CLIENT_ID=your_client_id
+GMAIL_CLIENT_SECRET=your_client_secret
+
+# API Configuration
+API_BASE_URL=http://localhost:8000
+API_KEY=dev-api-key
+```
 
 ## License
 

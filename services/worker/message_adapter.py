@@ -1,0 +1,256 @@
+"""Adapter to process single Gmail messages through the extraction pipeline.
+
+Additive — does not modify existing behavior.
+This adapter calls existing extractor functions without modifying them.
+"""
+import os
+import json
+import logging
+import uuid
+from typing import Dict, Any, Optional
+from datetime import datetime
+from pathlib import Path
+
+from shared import SessionLocal, Invoice, s3_client, settings, ensure_s3_bucket
+from services.ingestion.gmail_helpers import fetch_message_body_and_attachments
+from services.extractor.worker import InvoiceExtractor
+
+logger = logging.getLogger(__name__)
+
+
+def process_message_by_id(message_id: str, force: bool = False) -> Dict[str, Any]:
+    """Process a single Gmail message through the extraction pipeline.
+    
+    Additive — does not modify existing behavior.
+    This function:
+    1. Fetches message body and attachments from Gmail
+    2. Stages files locally
+    3. Invokes existing extractor pipeline
+    4. Stores results in database and S3
+    5. Returns structured result
+    
+    Implements idempotency: if message already processed, returns existing result.
+    
+    Args:
+        message_id: Gmail message ID
+        force: If True, reprocess even if already processed
+        
+    Returns:
+        Dict with:
+        - message_id
+        - invoice_records: List of extracted invoice data
+        - summary_text: Human-readable summary
+        - provenance_path: Path to stored provenance data
+        - status: "success" or "failed"
+        - confidence: Average confidence score
+    """
+    # Idempotency check: if already processed, return existing result
+    if not force:
+        db = SessionLocal()
+        try:
+            existing = db.query(Invoice).filter(Invoice.source_email_id == message_id).first()
+            if existing:
+                logger.info(f"Message {message_id} already processed, returning existing result")
+                extracted = existing.extracted or {}
+                normalized = existing.normalized or {}
+                
+                vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value') if isinstance(extracted.get('vendor_name'), dict) else None
+                invoice_date = normalized.get('date') or extracted.get('date', {}).get('value') if isinstance(extracted.get('date'), dict) else None
+                total_amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value') if isinstance(extracted.get('total_amount'), dict) else None
+                currency = normalized.get('currency') or extracted.get('currency', {}).get('value') if isinstance(extracted.get('currency'), dict) else None
+                line_items = normalized.get('line_items') or extracted.get('line_items', {}).get('value', []) if isinstance(extracted.get('line_items'), dict) else []
+                
+                confidences = [v.get('confidence', 0) for v in extracted.values() if isinstance(v, dict) and 'confidence' in v]
+                avg_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+                
+                summary_parts = []
+                if vendor_name:
+                    summary_parts.append(f"Vendor: {vendor_name}")
+                if invoice_date:
+                    summary_parts.append(f"Date: {invoice_date}")
+                if total_amount:
+                    summary_parts.append(f"Total: {currency or ''} {total_amount}")
+                summary_text = " | ".join(summary_parts) if summary_parts else "Invoice already processed"
+                
+                return {
+                    "message_id": message_id,
+                    "invoice_records": [{
+                        "vendor": vendor_name,
+                        "date": invoice_date,
+                        "total_amount": total_amount,
+                        "currency": currency,
+                        "line_items": line_items,
+                        "confidence": avg_confidence
+                    }],
+                    "summary_text": summary_text,
+                    "provenance_path": f"inbox/extraction/{existing.invoice_id}.json",
+                    "status": "success",
+                    "confidence": avg_confidence,
+                    "invoice_id": str(existing.invoice_id),
+                    "already_processed": True
+                }
+        finally:
+            db.close()
+    
+    try:
+        ensure_s3_bucket()
+        
+        # Create staging directory
+        staging_base = Path("data/staging")
+        staging_base.mkdir(parents=True, exist_ok=True)
+        staging_dir = str(staging_base / message_id)
+        
+        # Fetch message and attachments
+        logger.info(f"Fetching message {message_id} from Gmail...")
+        staged_data = fetch_message_body_and_attachments(message_id, staging_dir=staging_dir)
+        
+        email_data = staged_data['email_data']
+        attachments = staged_data['attachments']
+        raw_text = staged_data['raw_text']
+        
+        # Save raw email to S3
+        s3_key = f"inbox/raw/{message_id}.json"
+        with open(staged_data['email_json'], 'rb') as f:
+            s3_client.put_object(
+                Bucket=settings.s3_bucket,
+                Key=s3_key,
+                Body=f.read(),
+                ContentType='application/json'
+            )
+        
+        # Process attachments and save to S3
+        attachment_info = []
+        for att_path in attachments:
+            filename = os.path.basename(att_path)
+            s3_att_key = f"inbox/attachments/{message_id}/{filename}"
+            
+            with open(att_path, 'rb') as f:
+                s3_client.put_object(
+                    Bucket=settings.s3_bucket,
+                    Key=s3_att_key,
+                    Body=f.read(),
+                    ContentType='application/octet-stream'
+                )
+            
+            attachment_info.append({
+                "filename": filename,
+                "url": f"s3://{settings.s3_bucket}/{s3_att_key}",
+                "type": "application/pdf" if filename.lower().endswith('.pdf') else "application/octet-stream"
+            })
+        
+        # Extract invoice data using existing extractor
+        extractor = InvoiceExtractor()
+        extracted = extractor.extract_all_fields(raw_text, attachment_info)
+        
+        # Process attachments for line items
+        all_line_items = []
+        for att_path in attachments:
+            if att_path.lower().endswith('.pdf'):
+                try:
+                    with open(att_path, 'rb') as f:
+                        file_bytes = f.read()
+                    _, line_items = extractor.extract_text_from_pdf(file_bytes)
+                    all_line_items.extend(line_items)
+                except Exception as e:
+                    logger.warning(f"Error extracting from PDF {att_path}: {e}")
+        
+        if all_line_items:
+            extracted['line_items'] = {
+                "value": all_line_items,
+                "confidence": 0.85,
+                "provenance": {"method": "table_extraction"}
+            }
+        
+        # Calculate confidence
+        confidences = [v.get('confidence', 0) for v in extracted.values() if isinstance(v, dict) and 'confidence' in v]
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+        
+        # Create invoice record
+        invoice_id = uuid.uuid4()
+        invoice = Invoice(
+            invoice_id=invoice_id,
+            source_email_id=message_id,
+            raw_email_s3=f"s3://{settings.s3_bucket}/{s3_key}",
+            attachments=attachment_info,
+            raw_text=raw_text,
+            extracted=extracted,
+            normalized={},
+            tags=[],
+            extractor_version=settings.extractor_version,
+            reconciliation_status='needs_review',
+            extra={"avg_confidence": avg_confidence}
+        )
+        
+        db = SessionLocal()
+        try:
+            db.add(invoice)
+            db.commit()
+            
+            # Save extraction JSON to S3
+            extraction_json = {
+                "invoice_id": str(invoice_id),
+                "message_id": message_id,
+                "extracted": extracted,
+                "raw_text": raw_text[:1000],
+                "extracted_at": datetime.now().isoformat()
+            }
+            
+            s3_extraction_key = f"inbox/extraction/{invoice_id}.json"
+            s3_client.put_object(
+                Bucket=settings.s3_bucket,
+                Key=s3_extraction_key,
+                Body=json.dumps(extraction_json).encode('utf-8'),
+                ContentType='application/json'
+            )
+            
+            # Build invoice records for response
+            invoice_records = []
+            vendor_name = extracted.get('vendor_name', {}).get('value') if isinstance(extracted.get('vendor_name'), dict) else None
+            invoice_date = extracted.get('date', {}).get('value') if isinstance(extracted.get('date'), dict) else None
+            total_amount = extracted.get('total_amount', {}).get('value') if isinstance(extracted.get('total_amount'), dict) else None
+            currency = extracted.get('currency', {}).get('value') if isinstance(extracted.get('currency'), dict) else None
+            line_items = extracted.get('line_items', {}).get('value', []) if isinstance(extracted.get('line_items'), dict) else []
+            
+            invoice_records.append({
+                "vendor": vendor_name,
+                "date": invoice_date,
+                "total_amount": total_amount,
+                "currency": currency,
+                "line_items": line_items,
+                "confidence": avg_confidence
+            })
+            
+            # Build summary
+            summary_parts = []
+            if vendor_name:
+                summary_parts.append(f"Vendor: {vendor_name}")
+            if invoice_date:
+                summary_parts.append(f"Date: {invoice_date}")
+            if total_amount:
+                summary_parts.append(f"Total: {currency or ''} {total_amount}")
+            summary_text = " | ".join(summary_parts) if summary_parts else "Invoice extracted with low confidence"
+            
+            return {
+                "message_id": message_id,
+                "invoice_records": invoice_records,
+                "summary_text": summary_text,
+                "provenance_path": s3_extraction_key,
+                "status": "success",
+                "confidence": avg_confidence,
+                "invoice_id": str(invoice_id)
+            }
+        
+        finally:
+            db.close()
+    
+    except Exception as e:
+        logger.error(f"Error processing message {message_id}: {e}")
+        return {
+            "message_id": message_id,
+            "invoice_records": [],
+            "summary_text": f"Processing failed: {str(e)}",
+            "provenance_path": None,
+            "status": "failed",
+            "confidence": 0.0
+        }
+

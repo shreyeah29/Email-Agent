@@ -1,11 +1,10 @@
-"""Email ingestion service - polls Gmail/Outlook and enqueues extraction jobs."""
+"""Email ingestion service - polls Gmail and enqueues extraction jobs."""
 import os
 import json
 import logging
 import time
 from datetime import datetime
 from typing import List, Dict, Any
-from email.utils import parsedate_to_datetime
 import base64
 
 from google.auth.transport.requests import Request
@@ -13,9 +12,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
-import requests
-from msal import ConfidentialClientApplication
 
 from shared import settings, s3_client, redis_client, ensure_s3_bucket
 
@@ -38,7 +34,7 @@ class GmailIngester:
         creds = None
         token_file = 'token.json'
         
-        if os.path.exists(token_file):
+        if os.path.exists(token_file) and os.path.isfile(token_file):
             creds = Credentials.from_authorized_user_file(token_file, SCOPES)
         
         if not creds or not creds.valid:
@@ -61,7 +57,17 @@ class GmailIngester:
                     },
                     SCOPES
                 )
-                creds = flow.run_local_server(port=0)
+                try:
+                    creds = flow.run_local_server(port=0)
+                except Exception as e:
+                    # If browser can't be opened (e.g., in Docker), print auth URL
+                    logger.warning(f"Could not open browser: {e}")
+                    auth_url, _ = flow.authorization_url(prompt='consent')
+                    logger.info(f"Please visit this URL to authorize the application:")
+                    logger.info(f"{auth_url}")
+                    logger.info("After authorization, you will be redirected. Copy the 'code' parameter from the URL.")
+                    logger.info("Then run: python -c \"from services.ingestion.main import *; flow.fetch_token(code='YOUR_CODE')\"")
+                    return
             
             with open(token_file, 'w') as token:
                 token.write(creds.to_json())
@@ -72,7 +78,7 @@ class GmailIngester:
         except Exception as e:
             logger.error(f"Gmail authentication failed: {e}")
     
-    def fetch_messages(self, query: str = "is:unread", max_results: int = 10) -> List[Dict]:
+    def fetch_messages(self, query: str = "is:unread", max_results: int = 50) -> List[Dict]:
         """Fetch messages from Gmail."""
         if not self.service:
             return []
@@ -86,6 +92,66 @@ class GmailIngester:
         except HttpError as e:
             logger.error(f"Error fetching Gmail messages: {e}")
             return []
+    
+    def is_invoice_related(self, message: Dict) -> bool:
+        """Check if message is likely an invoice/receipt/bill."""
+        # Get message details
+        full_message = self.get_message(message.get('id', ''))
+        if not full_message:
+            return False
+        
+        # Check subject and snippet for keywords
+        subject = ""
+        snippet = full_message.get('snippet', '').lower()
+        
+        headers = full_message.get('payload', {}).get('headers', [])
+        for header in headers:
+            if header.get('name', '').lower() == 'subject':
+                subject = header.get('value', '').lower()
+                break
+        
+        # Keywords that indicate invoices/receipts
+        invoice_keywords = [
+            'invoice', 'receipt', 'bill', 'payment', 'statement',
+            'purchase order', 'po', 'quotation', 'quote', 'estimate',
+            'expense', 'voucher', 'tax', 'invoice number', 'inv-',
+            'bill to', 'amount due', 'total', 'subtotal'
+        ]
+        
+        # Check subject and snippet
+        text_to_check = f"{subject} {snippet}"
+        has_keyword = any(keyword in text_to_check for keyword in invoice_keywords)
+        
+        # Check for attachments (PDF, Excel, etc.)
+        has_attachments = False
+        parts = full_message.get('payload', {}).get('parts', [])
+        if not parts:
+            parts = [full_message.get('payload', {})]
+        
+        for part in parts:
+            filename = part.get('filename', '').lower()
+            mime_type = part.get('mimeType', '').lower()
+            
+            # Check for PDF, Excel, or image attachments
+            if filename.endswith(('.pdf', '.xlsx', '.xls', '.csv')) or \
+               mime_type in ('application/pdf', 'application/vnd.ms-excel', 
+                            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
+                has_attachments = True
+                break
+            
+            # Check nested parts
+            nested_parts = part.get('parts', [])
+            for nested in nested_parts:
+                nested_filename = nested.get('filename', '').lower()
+                nested_mime = nested.get('mimeType', '').lower()
+                if nested_filename.endswith(('.pdf', '.xlsx', '.xls', '.csv')) or \
+                   nested_mime in ('application/pdf', 'application/vnd.ms-excel',
+                                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
+                    has_attachments = True
+                    break
+        
+        # Return True if has keywords OR has relevant attachments
+        return has_keyword or has_attachments
     
     def get_message(self, msg_id: str) -> Dict[str, Any]:
         """Get full message details."""
@@ -144,155 +210,38 @@ class GmailIngester:
         return attachments_info
 
 
-class OutlookIngester:
-    """Microsoft Outlook email ingester."""
+def extract_email_body(message: Dict) -> str:
+    """Extract email body text from Gmail message."""
+    payload = message.get('payload', {})
+    body = ""
     
-    def __init__(self):
-        self.app = None
-        self.token = None
-        self._authenticate()
+    def extract_from_part(part):
+        text = ""
+        if part.get('mimeType') == 'text/plain':
+            data = part.get('body', {}).get('data', '')
+            if data:
+                text = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+        elif part.get('mimeType') == 'text/html':
+            data = part.get('body', {}).get('data', '')
+            if data:
+                html = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, 'html.parser')
+                text = soup.get_text()
+        
+        parts = part.get('parts', [])
+        for p in parts:
+            text += "\n" + extract_from_part(p)
+        return text
     
-    def _authenticate(self):
-        """Authenticate with Microsoft Graph API."""
-        if not all([settings.microsoft_client_id, settings.microsoft_client_secret, settings.microsoft_tenant_id]):
-            logger.warning("Microsoft credentials not configured. Skipping Outlook ingestion.")
-            return
-        
-        try:
-            self.app = ConfidentialClientApplication(
-                settings.microsoft_client_id,
-                authority=f"https://login.microsoftonline.com/{settings.microsoft_tenant_id}",
-                client_credential=settings.microsoft_client_secret
-            )
-            
-            result = self.app.acquire_token_for_client(
-                scopes=["https://graph.microsoft.com/.default"]
-            )
-            
-            if "access_token" in result:
-                self.token = result["access_token"]
-                logger.info("Microsoft Graph authentication successful")
-            else:
-                logger.error(f"Microsoft authentication failed: {result.get('error_description')}")
-        except Exception as e:
-            logger.error(f"Microsoft authentication error: {e}")
-    
-    def fetch_messages(self, max_results: int = 10) -> List[Dict]:
-        """Fetch unread messages from Outlook."""
-        if not self.token:
-            return []
-        
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.token}',
-                'Content-Type': 'application/json'
-            }
-            url = f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
-            params = {
-                '$filter': 'isRead eq false',
-                '$top': max_results,
-                '$select': 'id,subject,receivedDateTime,hasAttachments'
-            }
-            
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('value', [])
-        except Exception as e:
-            logger.error(f"Error fetching Outlook messages: {e}")
-            return []
-    
-    def get_message(self, msg_id: str) -> Dict[str, Any]:
-        """Get full message details."""
-        if not self.token:
-            return {}
-        
-        try:
-            headers = {'Authorization': f'Bearer {self.token}'}
-            url = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Error fetching Outlook message {msg_id}: {e}")
-            return {}
-    
-    def download_attachments(self, message: Dict, email_id: str) -> List[Dict]:
-        """Download attachments from Outlook message."""
-        attachments_info = []
-        
-        if not self.token or not message.get('hasAttachments'):
-            return attachments_info
-        
-        try:
-            headers = {'Authorization': f'Bearer {self.token}'}
-            url = f"https://graph.microsoft.com/v1.0/me/messages/{email_id}/attachments"
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            attachments = response.json().get('value', [])
-            
-            for att in attachments:
-                filename = att.get('name', 'attachment')
-                content_bytes = base64.b64decode(att.get('contentBytes', ''))
-                
-                s3_key = f"inbox/attachments/{email_id}/{filename}"
-                s3_client.put_object(
-                    Bucket=settings.s3_bucket,
-                    Key=s3_key,
-                    Body=content_bytes,
-                    ContentType=att.get('contentType', 'application/octet-stream')
-                )
-                
-                attachments_info.append({
-                    "filename": filename,
-                    "url": f"s3://{settings.s3_bucket}/{s3_key}",
-                    "type": att.get('contentType', 'application/octet-stream')
-                })
-                logger.info(f"Downloaded attachment: {filename}")
-        except Exception as e:
-            logger.error(f"Error downloading Outlook attachments: {e}")
-        
-        return attachments_info
+    body = extract_from_part(payload)
+    return body
 
 
-def extract_email_body(message: Dict, source: str) -> str:
-    """Extract email body text from Gmail or Outlook message."""
-    if source == 'gmail':
-        payload = message.get('payload', {})
-        body = ""
-        
-        def extract_from_part(part):
-            text = ""
-            if part.get('mimeType') == 'text/plain':
-                data = part.get('body', {}).get('data', '')
-                if data:
-                    text = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-            elif part.get('mimeType') == 'text/html':
-                data = part.get('body', {}).get('data', '')
-                if data:
-                    html = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(html, 'html.parser')
-                    text = soup.get_text()
-            
-            parts = part.get('parts', [])
-            for p in parts:
-                text += "\n" + extract_from_part(p)
-            return text
-        
-        body = extract_from_part(payload)
-        return body
-    
-    elif source == 'outlook':
-        return message.get('body', {}).get('content', '')
-    
-    return ""
-
-
-def process_message(message: Dict, source: str, ingester) -> bool:
+def process_message(message: Dict, ingester) -> bool:
     """Process a single email message: save to S3 and enqueue extraction job."""
     try:
-        email_id = message.get('id') if source == 'gmail' else message.get('id')
+        email_id = message.get('id')
         if not email_id:
             return False
         
@@ -314,15 +263,12 @@ def process_message(message: Dict, source: str, ingester) -> bool:
         attachments = ingester.download_attachments(full_message, email_id)
         
         # Extract received date
-        if source == 'gmail':
-            received_at = datetime.fromtimestamp(int(full_message.get('internalDate', 0)) / 1000).isoformat()
-        else:
-            received_at = full_message.get('receivedDateTime', datetime.now().isoformat())
+        received_at = datetime.fromtimestamp(int(full_message.get('internalDate', 0)) / 1000).isoformat()
         
         # Enqueue extraction job
         job_payload = {
             "email_id": email_id,
-            "source": source,
+            "source": "gmail",
             "s3_raw": f"s3://{settings.s3_bucket}/{s3_key}",
             "attachments": [att["url"] for att in attachments],
             "received_at": received_at
@@ -337,36 +283,50 @@ def process_message(message: Dict, source: str, ingester) -> bool:
         return False
 
 
-def run_ingestion():
-    """Main ingestion loop - polls email accounts and processes new messages."""
+def run_ingestion(auto_mode: bool = False):
+    """Main ingestion loop - processes emails.
+    
+    Args:
+        auto_mode: If True, continuously polls Gmail. If False, runs once and exits.
+    """
     ensure_s3_bucket()
     
     gmail_ingester = GmailIngester()
-    outlook_ingester = OutlookIngester()
-    
     processed_ids = set()
     
-    logger.info("Starting email ingestion service...")
+    if auto_mode:
+        logger.info("Starting email ingestion service (AUTO MODE - continuous polling)...")
+    else:
+        logger.info("Starting email ingestion service (MANUAL MODE - single run)...")
     
     while True:
         try:
             # Process Gmail
             if gmail_ingester.service:
-                gmail_messages = gmail_ingester.fetch_messages(query="is:unread", max_results=10)
+                # Fetch unread messages
+                gmail_messages = gmail_ingester.fetch_messages(query="is:unread", max_results=50)
+                
+                # Filter for invoice-related emails only
+                invoice_messages = []
                 for msg in gmail_messages:
+                    # Get full message to check if it's invoice-related
+                    full_msg = gmail_ingester.get_message(msg['id'])
+                    if full_msg and gmail_ingester.is_invoice_related(full_msg):
+                        invoice_messages.append(msg)
+                
+                logger.info(f"Found {len(gmail_messages)} unread emails, {len(invoice_messages)} are invoice-related")
+                
+                # Process only invoice-related emails
+                for msg in invoice_messages:
                     msg_id = msg['id']
                     if msg_id not in processed_ids:
-                        if process_message(msg, 'gmail', gmail_ingester):
+                        if process_message(msg, gmail_ingester):
                             processed_ids.add(msg_id)
+                            logger.info(f"✅ Processed invoice email: {msg_id}")
             
-            # Process Outlook
-            if outlook_ingester.token:
-                outlook_messages = outlook_ingester.fetch_messages(max_results=10)
-                for msg in outlook_messages:
-                    msg_id = msg['id']
-                    if msg_id not in processed_ids:
-                        if process_message(msg, 'outlook', outlook_ingester):
-                            processed_ids.add(msg_id)
+            if not auto_mode:
+                logger.info(f"Manual run complete. Processed {len(processed_ids)} invoice emails.")
+                break
             
             logger.info(f"Processed {len(processed_ids)} messages. Sleeping for 60 seconds...")
             time.sleep(60)  # Poll every minute
@@ -376,9 +336,13 @@ def run_ingestion():
             break
         except Exception as e:
             logger.error(f"Error in ingestion loop: {e}")
+            if not auto_mode:
+                break
             time.sleep(60)
 
 
 if __name__ == "__main__":
-    run_ingestion()
+    # Run in manual mode (processes once and exits)
+    # To run in auto mode, change to: run_ingestion(auto_mode=True)
+    run_ingestion(auto_mode=False)
 

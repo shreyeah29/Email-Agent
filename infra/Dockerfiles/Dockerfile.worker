@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Set PYTHONPATH to include project root
+ENV PYTHONPATH=/app
+
 # Default command (can be overridden)
 CMD ["python", "services/extractor/worker.py"]
 

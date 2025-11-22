@@ -33,10 +33,6 @@ class Settings(BaseSettings):
     gmail_client_secret: Optional[str] = os.getenv("GMAIL_CLIENT_SECRET")
     gmail_refresh_token: Optional[str] = os.getenv("GMAIL_REFRESH_TOKEN")
     
-    # Microsoft
-    microsoft_client_id: Optional[str] = os.getenv("MICROSOFT_CLIENT_ID")
-    microsoft_client_secret: Optional[str] = os.getenv("MICROSOFT_CLIENT_SECRET")
-    microsoft_tenant_id: Optional[str] = os.getenv("MICROSOFT_TENANT_ID")
     
     # Security
     secret_key: str = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
@@ -45,10 +41,12 @@ class Settings(BaseSettings):
     # Application
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     extractor_version: str = os.getenv("EXTRACTOR_VERSION", "v1.0.0")
+    ui_password: str = os.getenv("UI_PASSWORD", "admin123")
     
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"  # Ignore extra fields in .env
 
 
 settings = Settings()

@@ -15,23 +15,12 @@ st.set_page_config(page_title="Invoice Review", layout="wide")
 
 # Simple authentication (MVP)
 def check_password():
-    """Simple password check for MVP."""
-    if 'authenticated' not in st.session_state:
-        st.session_state.authenticated = False
-    
-    if not st.session_state.authenticated:
-        password = st.sidebar.text_input("Enter password", type="password")
-        if password == os.getenv("UI_PASSWORD", "admin123"):
-            st.session_state.authenticated = True
-            st.rerun()
-        elif password:
-            st.sidebar.error("Incorrect password")
-        return False
+    """Password check disabled - always return True."""
     return True
 
 
 def get_presigned_url(s3_path: str) -> str:
-    """Generate presigned URL for S3 object."""
+    """Generate presigned URL for S3 object, replacing internal hostname with localhost for browser access."""
     if not s3_path or not s3_path.startswith('s3://'):
         return ""
     
@@ -44,6 +33,9 @@ def get_presigned_url(s3_path: str) -> str:
             Params={'Bucket': bucket, 'Key': key},
             ExpiresIn=3600
         )
+        # Replace internal Docker hostname with localhost for browser access
+        if url and 'minio:9000' in url:
+            url = url.replace('minio:9000', 'localhost:9000')
         return url
     except Exception as e:
         st.error(f"Error generating URL: {e}")

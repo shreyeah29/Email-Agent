@@ -188,9 +188,9 @@ class InvoiceExtractor:
     
     def process_email(self, email_data: Dict, attachments: List[Dict]) -> tuple:
         """Process email and attachments to extract invoice data."""
-        # Extract email body text
+        # Extract email body text (Gmail format)
         email_body = ""
-        if 'payload' in email_data:  # Gmail
+        if 'payload' in email_data:
             def extract_body(part):
                 text = ""
                 if part.get('mimeType') == 'text/plain':
@@ -203,11 +203,6 @@ class InvoiceExtractor:
                     text += "\n" + extract_body(p)
                 return text
             email_body = extract_body(email_data.get('payload', {}))
-        elif 'body' in email_data:  # Outlook
-            from bs4 import BeautifulSoup
-            body_content = email_data.get('body', {}).get('content', '')
-            soup = BeautifulSoup(body_content, 'html.parser')
-            email_body = soup.get_text()
         
         all_text = [email_body]
         all_line_items = []

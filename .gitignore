@@ -45,3 +45,13 @@ Thumbs.db
 training_examples/
 *.json.bak
 
+# Gmail OAuth tokens and secrets
+token.pickle
+token.json
+token_cache.bin
+client_secret_*.json
+
+# Job store and staging
+jobs.json
+data/staging/
+
