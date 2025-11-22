@@ -28,10 +28,15 @@ class Settings(BaseSettings):
     s3_bucket: str = os.getenv("S3_BUCKET", "inbox-bucket")
     s3_region: str = os.getenv("S3_REGION", "us-east-1")
     
-    # Gmail
+    # Gmail (original account)
     gmail_client_id: Optional[str] = os.getenv("GMAIL_CLIENT_ID")
     gmail_client_secret: Optional[str] = os.getenv("GMAIL_CLIENT_SECRET")
     gmail_refresh_token: Optional[str] = os.getenv("GMAIL_REFRESH_TOKEN")
+    
+    # Gmail receipts-only account (for Sync Inbox feature)
+    gmail_client_secrets_path: Optional[str] = os.getenv("GMAIL_CLIENT_SECRETS_PATH")
+    gmail_token_path: Optional[str] = os.getenv("GMAIL_TOKEN_PATH", "token_receiptagent.pickle")
+    gmail_scopes: str = os.getenv("GMAIL_SCOPES", "https://www.googleapis.com/auth/gmail.readonly")
     
     
     # Security
@@ -42,6 +47,10 @@ class Settings(BaseSettings):
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     extractor_version: str = os.getenv("EXTRACTOR_VERSION", "v1.0.0")
     ui_password: str = os.getenv("UI_PASSWORD", "admin123")
+    
+    # LLM (Ollama - free, local)
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2")  # Free, local model
     
     class Config:
         env_file = ".env"

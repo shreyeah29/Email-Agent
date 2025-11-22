@@ -107,6 +107,16 @@ def query_invoices_natural_language(query_text: str, db: Session) -> Dict:
 
 def main():
     """Main dashboard app."""
+    # Initialize session state early to avoid "SessionInfo before initialization" error
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'last_sync' not in st.session_state:
+        st.session_state.last_sync = None
+    if 'show_clear_confirm' not in st.session_state:
+        st.session_state.show_clear_confirm = False
+    if 'switch_tab' not in st.session_state:
+        st.session_state.switch_tab = None
+    
     if not check_password():
         return
     
@@ -140,7 +150,7 @@ def main():
         st.divider()
         
         # Tabs for different views
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Summary", "📋 All Invoices", "💬 Query Agent", "📎 Attachments", "📧 Process Emails"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Summary", "💬 Query Agent", "📎 Attachments", "📧 Process Emails"])
         
         with tab1:
             st.header("📊 Data Summary & Management")
@@ -201,8 +211,8 @@ def main():
             
             st.divider()
             
-            # Recent activity
-            st.subheader("🕐 Recent Activity")
+            # Recent activity with attachments
+            st.subheader("🕐 Recent Invoices & Attachments")
             recent_invoices = db.query(Invoice).order_by(Invoice.created_at.desc()).limit(10).all()
             if recent_invoices:
                 for inv in recent_invoices:
@@ -210,10 +220,12 @@ def main():
                     normalized = inv.normalized or {}
                     vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value') or "Unknown"
                     amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value')
+                    attachments = inv.attachments or []
                     
-                    col1, col2, col3 = st.columns([3, 2, 1])
+                    col1, col2, col3, col4 = st.columns([2, 2, 1, 2])
                     with col1:
-                        st.write(f"📄 {inv.created_at.strftime('%Y-%m-%d %H:%M')} - {vendor_name}")
+                        st.write(f"📄 {inv.created_at.strftime('%Y-%m-%d %H:%M')}")
+                        st.caption(vendor_name)
                     with col2:
                         if amount:
                             st.write(f"💰 ${amount}")
@@ -222,6 +234,15 @@ def main():
                     with col3:
                         status_color = "🟢" if inv.reconciliation_status == "auto_matched" else "🟡" if inv.reconciliation_status == "needs_review" else "⚪"
                         st.write(f"{status_color} {inv.reconciliation_status or 'N/A'}")
+                    with col4:
+                        if attachments:
+                            for att in attachments[:2]:  # Show first 2 attachments
+                                if att.get('url', '').startswith('s3://'):
+                                    url = get_presigned_url(att['url'])
+                                    if url:
+                                        st.markdown(f"[📎 {att.get('filename', 'attachment')[:30]}]({url})")
+                        else:
+                            st.caption("No attachments")
             else:
                 st.info("No invoices processed yet.")
             
@@ -229,262 +250,182 @@ def main():
             
             # Quick actions
             st.subheader("⚡ Quick Actions")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 if st.button("🔄 Refresh Data", use_container_width=True):
                     st.rerun()
             with col2:
-                if st.button("📊 View All Invoices", use_container_width=True):
-                    st.session_state.switch_tab = "All Invoices"
+                if st.button("📎 View Attachments", use_container_width=True):
+                    if 'switch_tab' in st.session_state:
+                        st.session_state.switch_tab = "Attachments"
                     st.rerun()
             with col3:
                 if st.button("💬 Ask Agent", use_container_width=True):
-                    st.session_state.switch_tab = "Query Agent"
+                    if 'switch_tab' in st.session_state:
+                        st.session_state.switch_tab = "Query Agent"
                     st.rerun()
-        
-        with tab2:
-            st.header("All Processed Invoices")
+            with col4:
+                if st.button("🗑️ Clear All Data", use_container_width=True, type="secondary"):
+                    if 'show_clear_confirm' in st.session_state:
+                        st.session_state.show_clear_confirm = True
+                    st.rerun()
             
-            # Filters
-            col_filter1, col_filter2 = st.columns(2)
-            with col_filter1:
-                status_filter = st.selectbox(
-                    "Filter by Status",
-                    ["All", "needs_review", "auto_matched", "manual"],
-                    index=0
-                )
-            with col_filter2:
-                sort_by = st.selectbox(
-                    "Sort by",
-                    ["Newest First", "Oldest First", "By Amount"],
-                    index=0
-                )
-            
-            # Get invoices
-            query = db.query(Invoice)
-            if status_filter != "All":
-                query = query.filter(Invoice.reconciliation_status == status_filter)
-            
-            if sort_by == "Newest First":
-                query = query.order_by(Invoice.created_at.desc())
-            elif sort_by == "Oldest First":
-                query = query.order_by(Invoice.created_at.asc())
-            
-            invoices = query.limit(100).all()
-            
-            if not invoices:
-                st.info("No invoices found.")
-            else:
-                st.success(f"✅ Found {len(invoices)} invoice(s)")
-                
-                # Display invoices in cards
-                for idx, invoice in enumerate(invoices):
-                    # Create a card-like container
-                    with st.container():
-                        col_a, col_b, col_c, col_d = st.columns([2, 2, 2, 1])
-                        
-                        with col_a:
-                            st.markdown(f"### 📄 Invoice #{idx+1}")
-                            st.write(f"**Date:** {invoice.created_at.strftime('%Y-%m-%d %H:%M')}")
-                            st.write(f"**Status:** `{invoice.reconciliation_status or 'N/A'}`")
-                            st.write(f"**Source:** 📧 Gmail Email")
-                            if invoice.source_email_id:
-                                st.caption(f"Email ID: {invoice.source_email_id[:20]}...")
-                        
-                        with col_b:
-                            # Extract key fields
-                            extracted = invoice.extracted or {}
-                            normalized = invoice.normalized or {}
-                            
-                            vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value') or "Not extracted"
-                            total_amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value')
-                            currency = normalized.get('currency') or extracted.get('currency', {}).get('value') or ""
-                            
-                            st.write("**Vendor:**", vendor_name)
-                            if total_amount:
-                                st.write("**Amount:**", f"{currency} {total_amount}" if currency else str(total_amount))
-                            else:
-                                st.write("**Amount:** N/A")
-                            
-                            # Calculate confidence
-                            if extracted:
-                                confidences = [v.get('confidence', 0) for v in extracted.values() if isinstance(v, dict) and 'confidence' in v]
-                                avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-                                st.write("**Confidence:**", f"{avg_confidence:.2f}")
-                        
-                        with col_c:
-                            st.write("**Invoice ID:**")
-                            st.code(str(invoice.invoice_id)[:36], language=None)
-                            st.write("**Email ID:**")
-                            st.text(invoice.source_email_id or "N/A")
-                        
-                        with col_d:
-                            # Attachments
-                            attachments = invoice.attachments or []
-                            if attachments:
-                                st.write("**Attachments:**")
-                                for att in attachments:
-                                    if att.get('url', '').startswith('s3://'):
-                                        url = get_presigned_url(att['url'])
-                                        if url:
-                                            st.markdown(f"[📎 {att.get('filename', 'attachment')}]({url})")
-                            else:
-                                st.write("**Attachments:** None")
-                        
-                        # Expandable section for details
-                        with st.expander(f"🔍 View Details for Invoice #{idx+1}", expanded=False):
-                            # Show extracted fields
-                            if extracted:
-                                st.subheader("Extracted Fields")
-                                st.json(extracted)
-                            
-                            # Show normalized fields
-                            if normalized:
-                                st.subheader("Normalized Fields")
-                                st.json(normalized)
-                            
-                            # Show raw text preview
-                            if invoice.raw_text:
-                                st.subheader("Raw Text Preview")
-                                st.text_area("Text", invoice.raw_text[:1000], height=200, disabled=True, key=f"raw_text_{invoice.invoice_id}")
-                        
-                        st.divider()
-        
-        with tab3:
-            st.header("💬 Conversational Agent")
-            st.markdown("Ask questions about your invoices using natural language. The AI agent will analyze your data and provide answers with sources.")
-            
-            # API configuration
-            # Use 'api' service name when running in Docker, 'localhost' when running locally
-            default_api_url = "http://api:8000" if os.getenv("DOCKER_ENV") else "http://localhost:8000"
-            API_BASE_URL = os.getenv("API_BASE_URL", default_api_url)
-            API_KEY = os.getenv("API_KEY", "dev-api-key")
-            
-            # Query input with chat-like interface
-            if 'chat_history' not in st.session_state:
-                st.session_state.chat_history = []
-            
-            # Display chat history
-            if st.session_state.chat_history:
-                st.markdown("### 💬 Conversation History")
-                for chat in st.session_state.chat_history:
-                    with st.chat_message("user"):
-                        st.write(chat["query"])
-                    with st.chat_message("assistant"):
-                        st.write(chat["answer"])
-                        if chat.get("sources"):
-                            with st.expander(f"📎 Sources ({len(chat['sources'])} documents found)"):
-                                for i, source in enumerate(chat["sources"], 1):
-                                    st.markdown(f"**Document {i}:**")
-                                    st.write(f"• ID: `{source.get('invoice_id', 'N/A')[:8]}...`")
-                                    st.write(f"• Confidence: {source.get('confidence', 0):.2%}")
-                                    
-                                    # Show attachment names if available
-                                    if source.get('attachment_names'):
-                                        att_names = source.get('attachment_names', [])
-                                        st.write(f"• Attachments: {', '.join(att_names[:3])}")
-                                        if len(att_names) > 3:
-                                            st.write(f"  ... and {len(att_names) - 3} more")
-                                    
-                                    # Show snippet if available
-                                    if source.get('snippet'):
-                                        with st.expander("📄 Preview snippet"):
-                                            st.text(source['snippet'][:500])
-                                    
-                                    if source.get('url'):
-                                        st.markdown(f"  [🔗 View Full Document]({source['url']})")
-                                    st.divider()
-                        if chat.get("caveats"):
-                            st.warning("⚠️ " + " | ".join(chat["caveats"]))
-                st.divider()
-            
-            # Example queries as buttons
-            st.markdown("### 💡 Try These Queries:")
-            col1, col2 = st.columns(2)
-            example_queries = [
-                "How many invoices are there?",
-                "What's the total amount across all invoices?",
-                "Search for devops related documents",
-                "Summarize all attachments",
-                "What documents are about construction?",
-                "Find documents with PDF attachments"
-            ]
-            
-            # Track which example was clicked
-            selected_example = None
-            for i, example in enumerate(example_queries):
-                col = col1 if i % 2 == 0 else col2
-                with col:
-                    if st.button(f"💬 {example}", key=f"example_{i}", use_container_width=True):
-                        selected_example = example
-            
-            st.divider()
-            
-            # Query input - use text_input instead of chat_input (chat_input can't be in tabs)
-            query_text = st.text_input(
-                "💬 Ask a question about your invoices:",
-                value=selected_example if selected_example else "",
-                placeholder="e.g., 'How much did Company A spend in October 2025?'",
-                key="agent_query_input"
-            )
-            
-            # Process query button
-            if st.button("🔍 Ask Agent", type="primary", use_container_width=True):
-                query_to_process = selected_example if selected_example else query_text
-                if query_to_process:
-                    with st.spinner("🤔 Thinking..."):
+            # Clear data confirmation
+            if st.session_state.get('show_clear_confirm', False):
+                st.warning("⚠️ **Warning: This will delete ALL invoices and cannot be undone!**")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("✅ Yes, Delete Everything", type="primary", use_container_width=True):
+                        API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
+                        API_KEY = os.getenv("API_KEY", "dev-api-key")
                         try:
-                            # Call API agent endpoint
-                            response = requests.post(
-                                f"{API_BASE_URL}/agent",
-                                json={"text": query_to_process},
+                            response = requests.delete(
+                                f"{API_BASE_URL}/invoices/all",
                                 headers={"Authorization": f"Bearer {API_KEY}"},
                                 timeout=30
                             )
-                            
                             if response.status_code == 200:
                                 result = response.json()
-                                
-                                # Add to chat history
-                                st.session_state.chat_history.append({
-                                    "query": result["query"],
-                                    "answer": result["answer_text"],
-                                    "sources": result.get("sources", []),
-                                    "caveats": result.get("caveats", [])
-                                })
-                                
+                                st.success(f"✅ Cleared {result.get('deleted_invoices', 0)} invoices!")
+                                st.session_state.show_clear_confirm = False
                                 st.rerun()
                             else:
                                 st.error(f"Error: {response.text}")
                         except Exception as e:
-                            st.error(f"Error connecting to API: {e}")
-                            st.info("Make sure the API is running on http://localhost:8000")
-                else:
-                    st.warning("Please enter a question first")
+                            st.error(f"Error clearing data: {e}")
+                with col_no:
+                    if st.button("❌ Cancel", use_container_width=True):
+                        st.session_state.show_clear_confirm = False
+                        st.rerun()
+        
+        with tab2:
+            st.header("💬 AI Document Assistant")
+            st.markdown("Ask questions about any content in your PDFs. The AI analyzes all documents and provides clear answers.")
             
-            # Auto-process if example was selected
-            if selected_example:
-                with st.spinner("🤔 Thinking..."):
+            # API configuration
+            default_api_url = "http://api:8000" if os.getenv("DOCKER_ENV") else "http://localhost:8000"
+            API_BASE_URL = os.getenv("API_BASE_URL", default_api_url)
+            API_KEY = os.getenv("API_KEY", "dev-api-key")
+            
+            # Initialize chat history
+            if 'chat_history' not in st.session_state:
+                st.session_state.chat_history = []
+            
+            # Display chat history in a clean, modern way
+            if st.session_state.chat_history:
+                st.markdown("### 💬 Conversation")
+                for idx, chat in enumerate(st.session_state.chat_history):
+                    # User message
+                    with st.chat_message("user"):
+                        st.write(chat["query"])
+                    
+                    # Assistant response
+                    with st.chat_message("assistant"):
+                        # Clean answer (remove verbose prefixes)
+                        answer = chat["answer"]
+                        # Remove document tags from start if present
+                        if answer.startswith("[Document:"):
+                            parts = answer.split("]", 1)
+                            if len(parts) > 1:
+                                answer = parts[1].strip()
+                        
+                        # Display clean answer
+                        st.markdown(answer)
+                        
+                        # Only show visualizations if answer doesn't already contain a clear answer
+                        # (to avoid showing random numbers when we have a good answer)
+                        if not any(word in answer.lower() for word in ['is', 'was', 'are', 'were', 'the', 'unit price', 'cost']):
+                            import re
+                            # Check if answer contains numbers/amounts
+                            amounts = re.findall(r'[\$₹€£]?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?', answer)
+                            if amounts and len(amounts) > 1:
+                                # Multiple amounts - show as a simple list
+                                st.markdown("**Amounts found:**")
+                                for amt in amounts[:5]:
+                                    st.markdown(f"• {amt}")
+                            
+                            # Check for counts
+                            count_match = re.search(r'(\d+)\s+(?:invoice|document|item|record)', answer, re.IGNORECASE)
+                            if count_match:
+                                count = int(count_match.group(1))
+                                if count > 0:
+                                    st.metric("Total Count", count)
+                        
+                        # Show sources in a clean way
+                        if chat.get("sources"):
+                            st.markdown("---")
+                            st.markdown("**📎 Sources:**")
+                            for i, source in enumerate(chat["sources"][:3], 1):
+                                att_names = source.get('attachment_names', [])
+                                att_name = att_names[0] if att_names else "Document"
+                                
+                                col1, col2 = st.columns([3, 1])
+                                with col1:
+                                    st.markdown(f"**{i}.** {att_name}")
+                                with col2:
+                                    if source.get('url'):
+                                        st.markdown(f"[View PDF →]({source['url']})")
+                            
+                            if len(chat["sources"]) > 3:
+                                st.caption(f"... and {len(chat['sources']) - 3} more document(s)")
+                        
+                        # Show caveats if any
+                        if chat.get("caveats"):
+                            for caveat in chat["caveats"]:
+                                st.info(f"ℹ️ {caveat}")
+            
+            st.divider()
+            
+            # Query input - clean and simple
+            query_text = st.text_input(
+                "💬 Ask a question:",
+                placeholder="e.g., 'What is the unit price of Steel City 4 in. Octagon Box?' or 'Summarize all documents'",
+                key="agent_query_input",
+                label_visibility="collapsed"
+            )
+            
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                ask_button = st.button("🔍 Ask", type="primary", use_container_width=True)
+            
+            # Process query
+            if ask_button and query_text:
+                with st.spinner("🤔 Analyzing documents..."):
                     try:
                         response = requests.post(
                             f"{API_BASE_URL}/agent",
-                            json={"text": selected_example},
+                            json={"text": query_text},
                             headers={"Authorization": f"Bearer {API_KEY}"},
-                            timeout=30
+                            timeout=120  # Increased timeout for Ollama LLM processing
                         )
+                        
                         if response.status_code == 200:
                             result = response.json()
+                            
+                            # Clean up the answer
+                            answer = result["answer_text"]
+                            if answer.startswith("[Document:"):
+                                parts = answer.split("]", 1)
+                                if len(parts) > 1:
+                                    answer = parts[1].strip()
+                            
+                            # Add to chat history
                             st.session_state.chat_history.append({
-                                "query": result["query"],
-                                "answer": result["answer_text"],
+                                "query": query_text,
+                                "answer": answer,
                                 "sources": result.get("sources", []),
                                 "caveats": result.get("caveats", [])
                             })
+                            
                             st.rerun()
+                        else:
+                            st.error(f"Error: {response.text}")
                     except Exception as e:
-                        st.error(f"Error: {e}")
+                        st.error(f"Error connecting to API: {e}")
+            elif ask_button and not query_text:
+                st.warning("Please enter a question first")
         
-        with tab4:
+        with tab3:
             st.header("📎 All Attachments")
             
             # Get all invoices with attachments
@@ -519,8 +460,110 @@ def main():
                     
                     st.divider()
         
-        with tab5:
+        with tab4:
             st.header("📧 Process New Emails")
+            
+            # Sync Inbox section (for receipts-only account)
+            st.subheader("🔄 Sync Inbox (Receipts-Only Account)")
+            st.markdown("""
+            **Sync Inbox Feature:**
+            - Processes ALL emails with attachments from your receipts-only Gmail account
+            - Automatically extracts invoice/receipt data
+            - Marks processed emails with 'ProcessedByAgent' label
+            - Safe and non-destructive (only adds labels, never deletes)
+            """)
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                max_emails = st.number_input(
+                    "Maximum emails to process per sync:",
+                    min_value=1,
+                    max_value=500,
+                    value=100,
+                    key="sync_max_emails"
+                )
+            
+            with col2:
+                # Option to include already processed emails
+                include_processed = st.checkbox(
+                    "Include already processed emails",
+                    value=False,
+                    help="If checked, will sync emails even if they have the ProcessedByAgent label (useful after clearing data)"
+                )
+                
+                if st.button("🔄 Sync Inbox", type="primary", use_container_width=True):
+                    API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
+                    API_KEY = os.getenv("API_KEY", "dev-api-key")
+                    
+                    with st.spinner("Syncing inbox... This may take a few minutes."):
+                        try:
+                            response = requests.post(
+                                f"{API_BASE_URL}/sync_inbox",
+                                json={"max": int(max_emails), "include_processed": include_processed},
+                                headers={"Authorization": f"Bearer {API_KEY}"},
+                                timeout=600  # 10 minute timeout for large syncs
+                            )
+                            
+                            if response.status_code == 200:
+                                result = response.json()
+                                st.success("✅ Sync completed!")
+                                
+                                # Store result in session state
+                                st.session_state.last_sync = {
+                                    "timestamp": datetime.now().isoformat(),
+                                    "total_found": result.get("total_found", 0),
+                                    "processed": result.get("processed", 0),
+                                    "skipped": result.get("skipped", 0),
+                                    "errors": result.get("errors", 0),
+                                    "new_invoices": result.get("new_invoices", 0)
+                                }
+                                
+                                # Display results
+                                st.markdown("### 📊 Sync Results")
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Total Found", result.get("total_found", 0))
+                                with col2:
+                                    st.metric("Processed", result.get("processed", 0))
+                                with col3:
+                                    st.metric("New Invoices", result.get("new_invoices", 0))
+                                with col4:
+                                    st.metric("Errors", result.get("errors", 0))
+                                
+                                if result.get("skipped", 0) > 0:
+                                    st.info(f"ℹ️ {result.get('skipped')} emails were skipped (already processed)")
+                                
+                                # Show message IDs if available
+                                if result.get("message_ids"):
+                                    with st.expander("📧 Processed Email IDs"):
+                                        for msg_id in result.get("message_ids", [])[:10]:
+                                            st.code(msg_id, language=None)
+                                
+                                # Show warning if found but not processed
+                                if result.get("total_found", 0) > 0 and result.get("processed", 0) == 0:
+                                    st.warning("⚠️ **Emails were found but none were processed.** Check the API logs for errors.")
+                                
+                                st.rerun()
+                            else:
+                                st.error(f"Sync failed: {response.text}")
+                        except Exception as e:
+                            st.error(f"Error syncing inbox: {e}")
+                            st.info("Make sure the API is running and Gmail credentials are configured.")
+            
+            # Show last sync status
+            if 'last_sync' in st.session_state and st.session_state.last_sync is not None:
+                sync_info = st.session_state.last_sync
+                st.divider()
+                st.markdown(f"**Last Sync:** {sync_info.get('timestamp', 'Unknown')}")
+                st.write(f"Found: {sync_info.get('total_found', 0)} | "
+                        f"Processed: {sync_info.get('processed', 0)} | "
+                        f"New Invoices: {sync_info.get('new_invoices', 0)}")
+            
+            st.divider()
+            
+            # Original email processing section
+            st.subheader("📧 Manual Email Processing")
             st.markdown("Manually trigger processing of invoice-related emails from Gmail")
             
             col1, col2 = st.columns([2, 1])
@@ -535,7 +578,7 @@ def main():
                 """)
             
             with col2:
-                if st.button("🔍 Scan Gmail for Invoices", type="primary"):
+                if st.button("🔍 Scan Gmail for Invoices", type="secondary", use_container_width=True):
                     st.info("""
                     **To process emails:**
                     

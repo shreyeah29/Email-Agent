@@ -16,101 +16,117 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from shared import settings
+
 logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.modify']
 
 
 def get_gmail_service():
-    """Get authenticated Gmail service, reusing existing token cache."""
-    creds = None
-    # Check environment variable first, then default
-    token_file = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
+    """Get authenticated Gmail service, using receipts-only account credentials.
     
-    # Try to load existing token
+    Updated to use new receipts-only account credentials.
+    """
+    creds = None
+    # Use receipts-only account credentials - same as gmail_sync
+    default_token = os.getenv('GMAIL_TOKEN_PATH', 'token_receiptagent.pickle')
+    # If default token is a directory, use alternative filename (same logic as gmail_sync)
+    if os.path.exists(default_token) and os.path.isdir(default_token):
+        token_file = "token_receiptagent_new.pickle"
+        logger.warning(f"{default_token} is a directory, using {token_file} instead")
+    else:
+        token_file = default_token
+    client_secrets_path = os.getenv('GMAIL_CLIENT_SECRETS_PATH') or settings.gmail_client_secrets_path or "/app/client_secret_729224522226-scuue33esjetj7b3qpkmjuekpmj036e5.apps.googleusercontent.com.json"
+    
+    # Try to load existing token (supports both pickle and JSON formats)
     if os.path.exists(token_file) and os.path.isfile(token_file):
         try:
-            # Load token without scopes first to get the token's actual scopes
-            import json
-            with open(token_file, 'r') as f:
-                token_data = json.load(f)
-            token_scopes = token_data.get('scopes', SCOPES)
-            # Use token's scopes or fallback to our required scopes
-            creds = Credentials.from_authorized_user_file(token_file, token_scopes)
-            logger.info(f"Loaded existing Gmail token from {token_file} with scopes: {token_scopes}")
+            # Try pickle format first (for receipts account)
+            if token_file.endswith('.pickle'):
+                import pickle
+                with open(token_file, 'rb') as f:
+                    loaded_obj = pickle.load(f)
+                    # Check if it's a Credentials object, not OAuth2Token
+                    if isinstance(loaded_obj, Credentials):
+                        creds = loaded_obj
+                        logger.info(f"Loaded existing Gmail token from {token_file} (pickle format)")
+                    else:
+                        logger.warning(f"Token file contains {type(loaded_obj).__name__} instead of Credentials. Please regenerate token.")
+                        creds = None
+            else:
+                # Try JSON format (json already imported at top)
+                with open(token_file, 'r') as f:
+                    token_data = json.load(f)
+                token_scopes = token_data.get('scopes', SCOPES)
+                creds = Credentials.from_authorized_user_file(token_file, token_scopes)
+                logger.info(f"Loaded existing Gmail token from {token_file} with scopes: {token_scopes}")
         except Exception as e:
             logger.warning(f"Could not load existing token from {token_file}: {e}")
-            # Try with our required scopes as fallback
-            try:
-                creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-                logger.info(f"Loaded token with fallback scopes")
-            except:
-                creds = None
+            creds = None
     
     # Refresh or get new token
-    if not creds or not creds.valid:
+    if not creds or (creds.expired if hasattr(creds, 'expired') else True):
         if creds and creds.expired and creds.refresh_token:
             try:
                 logger.info("Refreshing expired Gmail token...")
                 creds.refresh(Request())
                 # Save refreshed token
-                with open(token_file, 'w') as token:
-                    token.write(creds.to_json())
+                if token_file.endswith('.pickle'):
+                    import pickle
+                    with open(token_file, 'wb') as token:
+                        pickle.dump(creds, token)
+                else:
+                    with open(token_file, 'w') as token:
+                        token.write(creds.to_json())
                 logger.info("Token refreshed successfully")
             except Exception as e:
                 logger.error(f"Token refresh failed: {e}")
-                # If refresh fails, we still have the expired creds, try to use them
-                # The API might still work if it's only slightly expired
                 if not creds.refresh_token:
                     creds = None
         
         if not creds:
-            # Try to load from shared settings first
-            from shared import settings as app_settings
-            
-            client_id = app_settings.gmail_client_id or os.getenv('GMAIL_CLIENT_ID')
-            client_secret = app_settings.gmail_client_secret or os.getenv('GMAIL_CLIENT_SECRET')
-            
-            if client_id and client_secret:
-                flow = InstalledAppFlow.from_client_config(
-                    {
-                        "installed": {
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                            "token_uri": "https://oauth2.googleapis.com/token",
-                            "redirect_uris": ["http://localhost"]
-                        }
-                    },
-                    SCOPES
-                )
+            # Use receipts-only account credentials from client secrets file
+            if client_secrets_path and os.path.exists(client_secrets_path):
+                try:
+                    with open(client_secrets_path, 'r') as f:
+                        client_config = json.load(f)
+                    
+                    # Handle both 'installed' and 'web' client configs
+                    if 'installed' in client_config:
+                        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+                    elif 'web' in client_config:
+                        flow = InstalledAppFlow.from_client_config(
+                            {"installed": client_config['web']}, SCOPES
+                        )
+                    else:
+                        raise ValueError("Invalid client secrets format")
+                    
+                    logger.info(f"Starting OAuth flow with client secrets from {client_secrets_path}")
+                    try:
+                        creds = flow.run_local_server(port=0)
+                    except Exception as e:
+                        logger.error(f"OAuth flow failed: {e}")
+                        # Provide manual URL if browser not available
+                        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+                        auth_url, _ = flow.authorization_url(prompt='consent')
+                        logger.info(f"Manual OAuth URL: {auth_url}")
+                        raise
+                    
+                    # Save token
+                    if token_file.endswith('.pickle'):
+                        import pickle
+                        with open(token_file, 'wb') as token:
+                            pickle.dump(creds, token)
+                    else:
+                        with open(token_file, 'w') as token:
+                            token.write(creds.to_json())
+                    logger.info(f"Saved new token to {token_file}")
+                except Exception as e:
+                    logger.error(f"Error loading client secrets from {client_secrets_path}: {e}")
+                    raise ValueError(f"Gmail credentials error: {e}")
             else:
-                # Try client secrets file
-                client_secrets_path = os.getenv(
-                    'GMAIL_CLIENT_SECRETS_PATH',
-                    '/mnt/data/client_secret_256579107172-41mnqgf7c0q5kp8ebbnluao73901g2ve.apps.googleusercontent.com.json'
-                )
-                
-                if os.path.exists(client_secrets_path):
-                    flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, SCOPES)
-                else:
-                    raise ValueError("Gmail credentials not found. Set GMAIL_CLIENT_SECRETS_PATH or GMAIL_CLIENT_ID/SECRET")
-            
-            # Try to run OAuth flow (may fail in Docker without browser)
-            try:
-                creds = flow.run_local_server(port=0)
-            except Exception as e:
-                if "could not locate runnable browser" in str(e) or "browser" in str(e).lower():
-                    raise ValueError(
-                        "Gmail OAuth requires browser. Token not found or expired. "
-                        "Please run 'python get_gmail_token.py' locally to generate token.json, "
-                        "then mount it in Docker."
-                    )
-                raise
-        
-        # Save token for future use
-        with open(token_file, 'w') as token:
-            token.write(creds.to_json())
+                raise ValueError("Gmail credentials not found. Set GMAIL_CLIENT_SECRETS_PATH")
     
     try:
         service = build('gmail', 'v1', credentials=creds)
@@ -227,7 +243,7 @@ def get_candidate_messages(query: str = "has:attachment subject:(invoice OR rece
         return []
 
 
-def fetch_message_body_and_attachments(message_id: str, staging_dir: Optional[str] = None) -> Dict[str, Any]:
+def fetch_message_body_and_attachments(message_id: str, staging_dir: Optional[str] = None, service: Any = None) -> Dict[str, Any]:
     """Download message body and attachments to staging directory.
     
     Additive — does not modify existing behavior.
@@ -235,11 +251,13 @@ def fetch_message_body_and_attachments(message_id: str, staging_dir: Optional[st
     Args:
         message_id: Gmail message ID
         staging_dir: Directory to save attachments (default: temp directory)
+        service: Optional Gmail service object (if provided, will use this instead of creating new one)
         
     Returns:
         Dict with 'email_json', 'email_data', 'attachments' (list of file paths), 'raw_text', 'staging_dir'
     """
-    service = get_gmail_service()
+    if service is None:
+        service = get_gmail_service()
     if not service:
         raise ValueError("Gmail service not available")
     

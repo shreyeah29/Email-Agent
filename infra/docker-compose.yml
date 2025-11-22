@@ -49,6 +49,8 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfiles/Dockerfile.api
+    env_file:
+      - ../.env
     environment:
       DATABASE_URL: postgresql://invoice_user:invoice_pass@postgres:5432/invoices
       REDIS_URL: redis://redis:6379/0
@@ -57,10 +59,11 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: inbox-bucket
       API_KEY: ${API_KEY:-dev-api-key}
-      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
-      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
-      GMAIL_CLIENT_SECRETS_PATH: ${GMAIL_CLIENT_SECRETS_PATH:-/mnt/data/client_secret_256579107172-41mnqgf7c0q5kp8ebbnluao73901g2ve.apps.googleusercontent.com.json}
-      GMAIL_TOKEN_PATH: /app/token.json
+      GMAIL_CLIENT_SECRETS_PATH: ${GMAIL_CLIENT_SECRETS_PATH:-/app/client_secret_729224522226-scuue33esjetj7b3qpkmjuekpmj036e5.apps.googleusercontent.com.json}
+      GMAIL_TOKEN_PATH: ${GMAIL_TOKEN_PATH:-token_receiptagent_new.pickle}
+      GMAIL_SCOPES: ${GMAIL_SCOPES:-https://www.googleapis.com/auth/gmail.readonly}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
     ports:
       - "8000:8000"
     depends_on:
@@ -70,7 +73,7 @@ services:
         condition: service_healthy
     volumes:
       - ../:/app
-      - ../token.json:/app/token.json:ro  # Mount Gmail token for candidates API
+      - ../token_receiptagent_new.pickle:/app/token_receiptagent_new.pickle:ro  # Mount receipts account token
     command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
 
   extractor:
@@ -122,6 +125,9 @@ services:
       UI_PASSWORD: admin123
       API_BASE_URL: http://api:8000
       DOCKER_ENV: "true"
+      GMAIL_CLIENT_SECRETS_PATH: ${GMAIL_CLIENT_SECRETS_PATH:-}
+      GMAIL_TOKEN_PATH: ${GMAIL_TOKEN_PATH:-token_receiptagent_new.pickle}
+      GMAIL_SCOPES: ${GMAIL_SCOPES:-https://www.googleapis.com/auth/gmail.readonly}
     depends_on:
       postgres:
         condition: service_healthy
@@ -149,9 +155,9 @@ services:
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: inbox-bucket
-      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
-      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
-      GMAIL_REFRESH_TOKEN: ${GMAIL_REFRESH_TOKEN:-}
+      GMAIL_CLIENT_SECRETS_PATH: ${GMAIL_CLIENT_SECRETS_PATH:-/app/client_secret_729224522226-scuue33esjetj7b3qpkmjuekpmj036e5.apps.googleusercontent.com.json}
+      GMAIL_TOKEN_PATH: ${GMAIL_TOKEN_PATH:-token_receiptagent_new.pickle}
+      GMAIL_SCOPES: ${GMAIL_SCOPES:-https://www.googleapis.com/auth/gmail.readonly}
     depends_on:
       postgres:
         condition: service_healthy
@@ -161,7 +167,7 @@ services:
         condition: service_healthy
     volumes:
       - ../:/app
-      - ../token.json:/app/token.json:ro  # For Gmail OAuth token (read-only)
+      - ../token_receiptagent.pickle:/app/token_receiptagent.pickle:ro  # For receipts account token (read-only)
     profiles:
       - manual  # Only start with --profile manual flag
     command: python services/ingestion/main.py

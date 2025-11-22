@@ -21,18 +21,42 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 st.set_page_config(page_title="Email Selector", layout="wide")
 
 def get_gmail_service():
-    """Get authenticated Gmail service."""
+    """Get authenticated Gmail service using receipts-only account."""
     creds = None
-    token_file = 'token.json'
+    # Use receipts-only account credentials
+    token_file = os.getenv('GMAIL_TOKEN_PATH', 'token_receiptagent.pickle')
+    client_secrets_path = os.getenv('GMAIL_CLIENT_SECRETS_PATH') or settings.gmail_client_secrets_path
     
+    # Try to load existing token
     if os.path.exists(token_file) and os.path.isfile(token_file):
-        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        try:
+            if token_file.endswith('.pickle'):
+                import pickle
+                with open(token_file, 'rb') as f:
+                    creds = pickle.load(f)
+            else:
+                creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        except Exception as e:
+            st.warning(f"Could not load token: {e}")
     
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            st.error("Gmail authentication required. Please run get_gmail_token.py first.")
+            try:
+                creds.refresh(Request())
+                # Save refreshed token
+                if token_file.endswith('.pickle'):
+                    import pickle
+                    with open(token_file, 'wb') as f:
+                        pickle.dump(creds, f)
+                else:
+                    with open(token_file, 'w') as f:
+                        f.write(creds.to_json())
+            except Exception as e:
+                st.error(f"Token refresh failed: {e}")
+                creds = None
+        
+        if not creds:
+            st.error("Gmail authentication required. Please configure GMAIL_CLIENT_SECRETS_PATH and generate token.")
             return None
     
     try:

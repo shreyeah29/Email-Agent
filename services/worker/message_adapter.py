@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from shared import SessionLocal, Invoice, s3_client, settings, ensure_s3_bucket
-from services.ingestion.gmail_helpers import fetch_message_body_and_attachments
+from services.ingestion.gmail_helpers import fetch_message_body_and_attachments, get_gmail_service
 from services.extractor.worker import InvoiceExtractor
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,9 @@ def process_message_by_id(message_id: str, force: bool = False) -> Dict[str, Any
         
         # Fetch message and attachments
         logger.info(f"Fetching message {message_id} from Gmail...")
-        staged_data = fetch_message_body_and_attachments(message_id, staging_dir=staging_dir)
+        # Get Gmail service to reuse credentials
+        gmail_service = get_gmail_service()
+        staged_data = fetch_message_body_and_attachments(message_id, staging_dir=staging_dir, service=gmail_service)
         
         email_data = staged_data['email_data']
         attachments = staged_data['attachments']

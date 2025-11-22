@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime
 from typing import List, Dict, Any
+
 import base64
 
 from google.auth.transport.requests import Request
@@ -30,35 +31,84 @@ class GmailIngester:
         self._authenticate()
     
     def _authenticate(self):
-        """Authenticate with Gmail API."""
+        """Authenticate with Gmail API using receipts-only account credentials."""
         creds = None
-        token_file = 'token.json'
+        # Use receipts-only account credentials
+        token_file = os.getenv('GMAIL_TOKEN_PATH', 'token_receiptagent.pickle')
+        client_secrets_path = os.getenv('GMAIL_CLIENT_SECRETS_PATH') or settings.gmail_client_secrets_path
         
+        # Try to load existing token
         if os.path.exists(token_file) and os.path.isfile(token_file):
-            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+            try:
+                if token_file.endswith('.pickle'):
+                    import pickle
+                    with open(token_file, 'rb') as f:
+                        creds = pickle.load(f)
+                else:
+                    creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+            except Exception as e:
+                logger.warning(f"Could not load token from {token_file}: {e}")
         
-        if not creds or not creds.valid:
+        if not creds or (creds.expired if hasattr(creds, 'expired') else True):
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not settings.gmail_client_id or not settings.gmail_client_secret:
-                    logger.warning("Gmail credentials not configured. Skipping Gmail ingestion.")
-                    return
-                
-                flow = InstalledAppFlow.from_client_config(
-                    {
-                        "installed": {
-                            "client_id": settings.gmail_client_id,
-                            "client_secret": settings.gmail_client_secret,
-                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                            "token_uri": "https://oauth2.googleapis.com/token",
-                            "redirect_uris": ["http://localhost"]
-                        }
-                    },
-                    SCOPES
-                )
                 try:
-                    creds = flow.run_local_server(port=0)
+                    creds.refresh(Request())
+                    # Save refreshed token
+                    if token_file.endswith('.pickle'):
+                        import pickle
+                        with open(token_file, 'wb') as f:
+                            pickle.dump(creds, f)
+                    else:
+                        with open(token_file, 'w') as f:
+                            f.write(creds.to_json())
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {e}")
+                    creds = None
+            else:
+                # Load from client secrets file
+                if client_secrets_path and os.path.exists(client_secrets_path):
+                    try:
+                        with open(client_secrets_path, 'r') as f:
+                            import json
+                            client_config = json.load(f)
+                        
+                        # Handle both 'installed' and 'web' client configs
+                        if 'installed' in client_config:
+                            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+                        elif 'web' in client_config:
+                            flow = InstalledAppFlow.from_client_config(
+                                {"installed": client_config['web']}, SCOPES
+                            )
+                        else:
+                            raise ValueError("Invalid client secrets format")
+                        
+                        try:
+                            creds = flow.run_local_server(port=0)
+                        except Exception as e:
+                            # Provide manual URL if browser not available
+                            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+                            auth_url, _ = flow.authorization_url(prompt='consent')
+                            print(f"\n⚠️  Browser not available. Please visit this URL to authorize:")
+                            print(f"   {auth_url}\n")
+                            code = input("Enter the authorization code: ")
+                            creds = flow.fetch_token(code=code)
+                        
+                        # Save token
+                        if token_file.endswith('.pickle'):
+                            import pickle
+                            with open(token_file, 'wb') as f:
+                                pickle.dump(creds, f)
+                        else:
+                            with open(token_file, 'w') as f:
+                                f.write(creds.to_json())
+                        logger.info(f"Saved new token to {token_file}")
+                    except Exception as e:
+                        logger.error(f"Error loading client secrets: {e}")
+                        logger.warning("Gmail credentials not configured. Skipping Gmail ingestion.")
+                        return
+                else:
+                    logger.warning("Gmail client secrets path not configured. Skipping Gmail ingestion.")
+                    return
                 except Exception as e:
                     # If browser can't be opened (e.g., in Docker), print auth URL
                     logger.warning(f"Could not open browser: {e}")
@@ -292,6 +342,8 @@ def run_ingestion(auto_mode: bool = False):
     ensure_s3_bucket()
     
     gmail_ingester = GmailIngester()
+
+
     processed_ids = set()
     
     if auto_mode:
