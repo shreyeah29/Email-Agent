@@ -48,6 +48,7 @@ training_examples/
 # Gmail OAuth tokens and secrets
 token.pickle
 token.json
+token_receiptagent*.pickle
 token_cache.bin
 client_secret_*.json
 
