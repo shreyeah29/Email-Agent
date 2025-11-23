@@ -140,28 +140,75 @@ def process_message_by_id(message_id: str, force: bool = False) -> Dict[str, Any
                 "type": "application/pdf" if filename.lower().endswith('.pdf') else "application/octet-stream"
             })
         
-        # Extract invoice data using existing extractor
+        # Use the full extraction pipeline (includes categorization)
         extractor = InvoiceExtractor()
-        extracted = extractor.extract_all_fields(raw_text, attachment_info)
         
-        # Process attachments for line items
+        # Process attachments for line items and text extraction
         all_line_items = []
+        pdf_texts = []
+        
         for att_path in attachments:
-            if att_path.lower().endswith('.pdf'):
+            filename = os.path.basename(att_path)
+            if filename.lower().endswith('.pdf'):
                 try:
                     with open(att_path, 'rb') as f:
                         file_bytes = f.read()
-                    _, line_items = extractor.extract_text_from_pdf(file_bytes)
+                    text, line_items = extractor.extract_text_from_pdf(file_bytes)
+                    pdf_texts.append(f"--- Attachment: {filename} ---\n{text}")
                     all_line_items.extend(line_items)
                 except Exception as e:
                     logger.warning(f"Error extracting from PDF {att_path}: {e}")
+            elif filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff')):
+                try:
+                    with open(att_path, 'rb') as f:
+                        file_bytes = f.read()
+                    text = extractor.extract_text_from_image(file_bytes)
+                    pdf_texts.append(f"--- Attachment: {filename} ---\n{text}")
+                except Exception as e:
+                    logger.warning(f"Error extracting from image {att_path}: {e}")
         
+        # Combine PDF/attachment text for extraction
+        pdf_only_text = "\n".join(pdf_texts) if pdf_texts else ""
+        
+        # Extract fields from PDF content only
+        try:
+            extracted = extractor.extract_all_fields(pdf_only_text, attachment_info)
+        except Exception as extract_error:
+            logger.error(f"Error in extract_all_fields: {extract_error}")
+            extracted = {}
+        
+        # Ensure extracted is a dict (fallback if extraction fails)
+        if not extracted or not isinstance(extracted, dict):
+            extracted = {}
+        
+        # Add categorized line items if found
         if all_line_items:
-            extracted['line_items'] = {
-                "value": all_line_items,
-                "confidence": 0.85,
-                "provenance": {"method": "table_extraction"}
-            }
+            try:
+                # Categorize items and assign BOM numbers
+                from services.extractor.categorizer import categorize_items_with_ollama
+                categorized_items = categorize_items_with_ollama(all_line_items)
+                
+                if not extracted:
+                    extracted = {}
+                
+                extracted['line_items'] = {
+                    "value": categorized_items,
+                    "confidence": 0.85,
+                    "provenance": {"method": "table_extraction_with_categorization"}
+                }
+            except Exception as cat_error:
+                logger.warning(f"Error categorizing items, using uncategorized: {cat_error}")
+                # Fallback: use uncategorized items
+                if not extracted:
+                    extracted = {}
+                extracted['line_items'] = {
+                    "value": all_line_items,
+                    "confidence": 0.85,
+                    "provenance": {"method": "table_extraction"}
+                }
+        
+        # For raw_text, combine email body with PDF content
+        full_text_with_email = raw_text + "\n" + pdf_only_text if pdf_only_text else raw_text
         
         # Calculate confidence
         confidences = [v.get('confidence', 0) for v in extracted.values() if isinstance(v, dict) and 'confidence' in v]
@@ -174,7 +221,7 @@ def process_message_by_id(message_id: str, force: bool = False) -> Dict[str, Any
             source_email_id=message_id,
             raw_email_s3=f"s3://{settings.s3_bucket}/{s3_key}",
             attachments=attachment_info,
-            raw_text=raw_text,
+            raw_text=full_text_with_email,
             extracted=extracted,
             normalized={},
             tags=[],
@@ -246,7 +293,10 @@ def process_message_by_id(message_id: str, force: bool = False) -> Dict[str, Any
             db.close()
     
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
         logger.error(f"Error processing message {message_id}: {e}")
+        logger.error(f"Full traceback:\n{error_trace}")
         return {
             "message_id": message_id,
             "invoice_records": [],

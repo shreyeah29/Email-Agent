@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2")  # Free, local model
     
+    # Gmail ingestion schedule
+    gmail_ingest_interval_minutes: int = int(os.getenv("GMAIL_INGEST_INTERVAL_MINUTES", "60"))
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

@@ -51,28 +51,19 @@ class SyncResponse(BaseModel):
     message_ids: list[str] = []
 
 
-@router.post("", response_model=SyncResponse)
-def sync_inbox(
-    request: SyncRequest,
-    db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
-):
-    """Sync receipts-only inbox - process all emails with attachments.
-    
-    Additive — does not modify existing behavior.
-    This endpoint:
-    1. Searches for unprocessed emails with attachments
-    2. Downloads email JSON and attachments
-    3. Processes through extraction pipeline
-    4. Marks emails as processed with label
+def sync_inbox_internal(max_results: int = 100, include_processed: bool = False) -> Dict[str, Any]:
+    """Internal function to sync inbox - can be called by scheduler or API endpoint.
     
     Args:
-        request: Sync request with optional max limit
-        db: Database session
+        max_results: Maximum number of emails to process
+        include_processed: If True, include emails with ProcessedByAgent label
         
     Returns:
-        SyncResponse with counts and statistics
+        Dict with sync results
     """
+    from shared import SessionLocal
+    
+    db = SessionLocal()
     try:
         # Build Gmail service for receipts account
         logger.info("Building Gmail service for receipts account...")
@@ -82,7 +73,7 @@ def sync_inbox(
         # has:attachment AND filename:(pdf OR xls OR xlsx OR jpg OR jpeg OR png)
         # Optionally exclude ProcessedByAgent label if include_processed is False
         base_query = "has:attachment filename:(pdf OR xls OR xlsx OR jpg OR jpeg OR png)"
-        if not request.include_processed:
+        if not include_processed:
             query = f"{base_query} -label:ProcessedByAgent"
         else:
             query = base_query
@@ -90,7 +81,7 @@ def sync_inbox(
         
         # Search for candidate messages
         logger.info(f"Searching for messages with query: {query}")
-        message_ids = search_messages(service, query, max_results=request.max or 100)
+        message_ids = search_messages(service, query, max_results=max_results)
         
         total_found = len(message_ids)
         processed = 0
@@ -155,14 +146,53 @@ def sync_inbox(
             f"skipped={skipped}, errors={errors}, new_invoices={new_invoices}"
         )
         
-        return SyncResponse(
-            total_found=total_found,
-            processed=processed,
-            skipped=skipped,
-            errors=errors,
-            new_invoices=new_invoices,
-            message_ids=processed_message_ids[:10]  # Return first 10 for reference
+        result = {
+            "total_found": total_found,
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+            "new_invoices": new_invoices,
+            "message_ids": processed_message_ids[:10]  # Return first 10 for reference
+        }
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Sync failed: {e}")
+        raise
+    finally:
+        db.close()
+
+
+@router.post("", response_model=SyncResponse)
+def sync_inbox(
+    request: SyncRequest,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key)
+):
+    """Sync receipts-only inbox - process all emails with attachments.
+    
+    Additive — does not modify existing behavior.
+    This endpoint:
+    1. Searches for unprocessed emails with attachments
+    2. Downloads email JSON and attachments
+    3. Processes through extraction pipeline
+    4. Marks emails as processed with label
+    
+    Args:
+        request: Sync request with optional max limit
+        db: Database session
+        
+    Returns:
+        SyncResponse with counts and statistics
+    """
+    try:
+        result = sync_inbox_internal(
+            max_results=request.max or 100,
+            include_processed=request.include_processed or False
         )
+        
+        return SyncResponse(**result)
     
     except Exception as e:
         logger.error(f"Sync inbox error: {e}")

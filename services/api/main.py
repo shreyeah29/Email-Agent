@@ -23,6 +23,19 @@ except ImportError:
 from shared import get_db, Invoice, Vendor, Project, InvoiceAudit, s3_client, settings
 from services.api.candidates import router as candidates_router
 from services.api.sync_inbox import router as sync_inbox_router
+# Import scheduler functions (may fail in test environments)
+try:
+    from services.api.scheduler import start_scheduler, get_scheduler_status
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    SCHEDULER_AVAILABLE = False
+    logger.warning("Scheduler module not available (likely missing apscheduler)")
+    
+    def start_scheduler():
+        pass
+    
+    def get_scheduler_status():
+        return {"status": "unavailable", "error": "apscheduler not installed"}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -195,6 +208,42 @@ def calculate_confidence(extracted: Dict) -> float:
 def health_check():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+@app.on_event("startup")
+def startup_event():
+    """Start scheduler on API startup."""
+    # Skip scheduler in test environment
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv("TESTING") or not SCHEDULER_AVAILABLE:
+        logger.info("Skipping scheduler startup (test environment or scheduler unavailable)")
+        return
+    
+    try:
+        start_scheduler()
+        logger.info("✅ Gmail ingestion scheduler started on API startup")
+    except Exception as e:
+        logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
+        # Don't fail startup if scheduler fails
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Stop scheduler on API shutdown."""
+    if not SCHEDULER_AVAILABLE:
+        return
+    
+    try:
+        from services.api.scheduler import stop_scheduler
+        stop_scheduler()
+        logger.info("Scheduler stopped on API shutdown")
+    except Exception as e:
+        logger.error(f"Error stopping scheduler: {e}")
+
+
+@app.get("/scheduler/status")
+def get_scheduler_status_endpoint(api_key: str = Depends(verify_api_key)):
+    """Get scheduler status."""
+    return get_scheduler_status()
 
 
 @app.delete("/invoices/all", dependencies=[Depends(verify_api_key)])

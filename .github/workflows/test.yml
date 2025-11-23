@@ -46,7 +46,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y tesseract-ocr poppler-utils
+        sudo apt-get install -y tesseract-ocr poppler-utils postgresql-client
     
     - name: Install Python dependencies
       run: |
@@ -63,6 +63,18 @@ jobs:
       env:
         TEST_DATABASE_URL: postgresql://invoice_user:invoice_pass@localhost:5432/invoices_test
         DATABASE_URL: postgresql://invoice_user:invoice_pass@localhost:5432/invoices_test
+        REDIS_URL: redis://localhost:6379/0
+        S3_ENDPOINT_URL: ""
+        S3_ACCESS_KEY: test
+        S3_SECRET_KEY: test
+        S3_BUCKET: test-bucket
+        API_KEY: test-api-key
+        SECRET_KEY: test-secret-key
+        GMAIL_INGEST_INTERVAL_MINUTES: 60
+        OLLAMA_BASE_URL: http://localhost:11434
+        OLLAMA_MODEL: llama3.2
+        TESTING: "true"
+        PYTEST_CURRENT_TEST: "true"
       run: |
-        pytest tests/ -v --cov=services --cov=shared
+        pytest tests/ -v --cov=services --cov=shared --cov-report=xml --tb=short
 

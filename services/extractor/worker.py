@@ -113,7 +113,7 @@ class InvoiceExtractor:
                             normalized_headers = {}
                             for i, h in enumerate(headers):
                                 h_lower = h.lower()
-                                if 'description' in h_lower or 'item' in h_lower or 'product' in h_lower:
+                                if 'description' in h_lower or 'item' in h_lower or 'product' in h_lower or 'service' in h_lower:
                                     normalized_headers[i] = 'description'
                                 elif 'qty' in h_lower or 'quantity' in h_lower:
                                     normalized_headers[i] = 'quantity'
@@ -121,7 +121,11 @@ class InvoiceExtractor:
                                     normalized_headers[i] = 'unit_price'
                                 elif 'price' in h_lower and 'unit' not in h_lower:
                                     normalized_headers[i] = 'unit_price'
-                                elif 'subtotal' in h_lower or 'total' in h_lower or 'amount' in h_lower:
+                                elif 'rate' in h_lower:  # For receipts like "Rate: $485.00"
+                                    normalized_headers[i] = 'unit_price'
+                                elif 'subtotal' in h_lower or ('total' in h_lower and 'amount' not in h_lower):
+                                    normalized_headers[i] = 'subtotal'
+                                elif 'amount' in h_lower and 'total' not in h_lower:
                                     normalized_headers[i] = 'subtotal'
                                 elif 'sku' in h_lower or 'model' in h_lower:
                                     normalized_headers[i] = 'sku'
@@ -148,8 +152,11 @@ class InvoiceExtractor:
                                             else:
                                                 item[header_name] = value
                                     
-                                    # Only add if it has meaningful data (at least description or quantity)
-                                    if item and (item.get('description') or item.get('quantity')):
+                                    # Only add if it has meaningful data (at least description, quantity, or amount)
+                                    if item and (item.get('description') or item.get('quantity') or item.get('subtotal') or item.get('unit_price')):
+                                        # If no quantity but has amount/rate, set quantity to 1
+                                        if not item.get('quantity') and (item.get('subtotal') or item.get('unit_price')):
+                                            item['quantity'] = 1
                                         line_items.append(item)
             
             full_text = "\n".join(text_parts)
@@ -419,10 +426,8 @@ class InvoiceExtractor:
                         "provenance": {"method": "header_pattern", "snippet": line_clean}
                     }
         
-        # Extract line items if available
-        # This would be enhanced with table extraction from PDFs
-        
-        return extracted
+        # No vendor found
+        return None
     
     def process_email(self, email_data: Dict, attachments: List[Dict]) -> tuple:
         """Process email and attachments to extract invoice data."""
@@ -475,17 +480,28 @@ class InvoiceExtractor:
         pdf_only_text = "\n".join(pdf_texts) if pdf_texts else ""
         
         # Extract fields - ONLY from PDF content, email body is completely ignored
+        # Prioritize PDF content for date extraction (use date from attachment, not email)
         extracted = self.extract_all_fields(pdf_only_text, attachments)
+        
+        # If date was found in PDF, use it; otherwise try email body as last resort
+        if not extracted.get('date') and email_body:
+            date_from_email = self.extract_field('date', email_body)
+            if date_from_email:
+                extracted['date'] = date_from_email
         
         # For raw_text storage, we still include email body for reference, but extraction uses PDF only
         full_text_with_email = email_body + "\n" + pdf_only_text if pdf_only_text else email_body
         
         # Add line items if found
         if all_line_items:
+            # Categorize items and assign BOM numbers
+            from services.extractor.categorizer import categorize_items_with_ollama
+            categorized_items = categorize_items_with_ollama(all_line_items)
+            
             extracted['line_items'] = {
-                "value": all_line_items,
+                "value": categorized_items,
                 "confidence": 0.85,
-                "provenance": {"method": "table_extraction"}
+                "provenance": {"method": "table_extraction_with_categorization"}
             }
         
         return full_text_with_email, extracted

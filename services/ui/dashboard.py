@@ -6,19 +6,121 @@ from datetime import datetime
 from typing import Dict, Any, List
 from uuid import UUID
 import requests
+import pandas as pd
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from shared import SessionLocal, Invoice, Vendor, Project, s3_client, settings
+from services.ui.styles import apply_custom_css
 import requests
 
 # Page config
 st.set_page_config(page_title="Invoice Dashboard", layout="wide", initial_sidebar_state="expanded")
 
+# Apply professional styling
+apply_custom_css()
+
 # Authentication disabled - no password required
 def check_password():
     """Password check disabled - always return True."""
     return True
+
+
+def get_category_color(category: str) -> str:
+    """Get CSS class for category badge."""
+    category_lower = category.lower()
+    color_map = {
+        'electrical': 'category-electrical',
+        'hardware': 'category-hardware',
+        'tools': 'category-tools',
+        'plumbing': 'category-plumbing',
+        'hvac': 'category-hvac',
+        'materials': 'category-materials',
+        'safety': 'category-safety',
+        'fasteners': 'category-fasteners',
+        'lumber': 'category-lumber',
+        'concrete': 'category-concrete',
+    }
+    return color_map.get(category_lower, 'category-other')
+
+
+def display_categorized_items(invoice: Invoice):
+    """Display categorized line items in beautiful tables grouped by category."""
+    extracted = invoice.extracted or {}
+    
+    # Handle different possible structures
+    line_items_obj = extracted.get('line_items', {})
+    if isinstance(line_items_obj, dict):
+        line_items_data = line_items_obj.get('value', [])
+    elif isinstance(line_items_obj, list):
+        line_items_data = line_items_obj
+    else:
+        line_items_data = []
+    
+    # Debug: log what we found
+    if not line_items_data:
+        st.info("No line items found for this invoice.")
+        # Debug info
+        if st.checkbox("Show debug info", key=f"debug_{invoice.invoice_id}"):
+            st.json({"extracted_keys": list(extracted.keys()), "line_items_obj": line_items_obj})
+        return
+    
+    # Group items by category
+    items_by_category = {}
+    for item in line_items_data:
+        category = item.get('category', 'Other')
+        if category not in items_by_category:
+            items_by_category[category] = []
+        items_by_category[category].append(item)
+    
+    # Display each category
+    for category, items in sorted(items_by_category.items()):
+        st.markdown(f"### {category}")
+        
+        # Prepare data for table
+        table_data = []
+        category_total = 0.0
+        
+        for item in items:
+            description = item.get('description', 'N/A')
+            bom_number = item.get('bom_number', 'N/A')
+            quantity = item.get('quantity', 0)
+            unit_price = item.get('unit_price', 0)
+            subtotal = item.get('subtotal', 0)
+            sku = item.get('sku', 'N/A')
+            
+            # Clean unit_price if it's a string
+            if isinstance(unit_price, str):
+                import re
+                price_match = re.search(r'[\d,]+\.?\d*', unit_price)
+                if price_match:
+                    unit_price = float(price_match.group(0).replace(',', ''))
+                else:
+                    unit_price = 0.0
+            
+            if isinstance(subtotal, (int, float)):
+                category_total += float(subtotal)
+            
+            table_data.append({
+                'BOM': bom_number,
+                'Description': description,
+                'SKU': sku,
+                'Qty': quantity,
+                'Unit Price': f"${unit_price:.2f}" if isinstance(unit_price, (int, float)) else str(unit_price),
+                'Subtotal': f"${subtotal:.2f}" if isinstance(subtotal, (int, float)) else str(subtotal)
+            })
+        
+        # Create DataFrame and display
+        df = pd.DataFrame(table_data)
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # Category total
+        st.markdown(f"**{category} Subtotal:** ${category_total:,.2f}")
+        st.divider()
 
 
 def get_presigned_url(s3_path: str) -> str:
@@ -120,52 +222,51 @@ def main():
     if not check_password():
         return
     
-    st.title("📊 Invoice Dashboard")
-    st.markdown("View and query all processed invoices from your Gmail")
+    # Professional header - Modern Finance Dashboard Style
+    st.markdown("""
+    <div style="text-align: center; padding: 3rem 2rem; background: linear-gradient(135deg, #0066FF 0%, #0052CC 100%); border-radius: 16px; margin-bottom: 2.5rem; box-shadow: 0 10px 25px rgba(0, 102, 255, 0.25);">
+        <h1 style="font-size: 3.25rem; font-weight: 800; color: #FFFFFF; margin-bottom: 0.75rem; letter-spacing: -0.02em; text-shadow: 0 2px 8px rgba(0,0,0,0.15); font-family: 'Inter', sans-serif;">
+            📊 Invoice Dashboard
+        </h1>
+        <p style="font-size: 1.125rem; color: #FFFFFF; margin: 0; font-weight: 500; opacity: 0.95; font-family: 'Inter', sans-serif;">
+            Professional Invoice Management & Analysis System
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Info banner
+    # Info banner - Professional styling
     st.info("📧 **All invoices shown here were automatically processed from your Gmail inbox.** The ingestion service continuously monitors your email and processes new invoices every 60 seconds.")
     
     db = SessionLocal()
     try:
         # Get statistics
         total_invoices = db.query(Invoice).count()
-        needs_review = db.query(Invoice).filter(Invoice.reconciliation_status == 'needs_review').count()
-        auto_matched = db.query(Invoice).filter(Invoice.reconciliation_status == 'auto_matched').count()
+        invoices_with_attachments = db.query(Invoice).filter(
+            func.jsonb_array_length(Invoice.attachments) > 0
+        ).count()
         
-        # Stats row
-        col1, col2, col3, col4 = st.columns(4)
+        # Stats row - simplified (removed review status metrics)
+        col1, col2 = st.columns(2)
         with col1:
             st.metric("Total Invoices", total_invoices)
         with col2:
-            st.metric("Needs Review", needs_review)
-        with col3:
-            st.metric("Auto Matched", auto_matched)
-        with col4:
-            invoices_with_attachments = db.query(Invoice).filter(
-                func.jsonb_array_length(Invoice.attachments) > 0
-            ).count()
             st.metric("With Attachments", invoices_with_attachments)
         
         st.divider()
         
         # Tabs for different views
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Summary", "💬 Query Agent", "📎 Attachments", "📧 Process Emails"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Summary", "📋 Itemized Invoices", "💬 Query Agent", "📎 Attachments", "📧 Process Emails"])
         
         with tab1:
             st.header("📊 Data Summary & Management")
             
-            # Overall statistics
+            # Overall statistics - simplified (removed review status)
             st.subheader("📈 Overall Statistics")
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2 = st.columns(2)
             
             with col1:
                 st.metric("Total Invoices", total_invoices)
             with col2:
-                st.metric("Needs Review", needs_review, delta=f"-{total_invoices - needs_review}" if total_invoices > 0 else None)
-            with col3:
-                st.metric("Auto Matched", auto_matched, delta=f"{auto_matched}" if auto_matched > 0 else None)
-            with col4:
                 invoices_with_attachments = db.query(Invoice).filter(
                     func.jsonb_array_length(Invoice.attachments) > 0
                 ).count()
@@ -185,8 +286,26 @@ def main():
                 normalized = inv.normalized or {}
                 
                 amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value')
-                currency = normalized.get('currency') or extracted.get('currency', {}).get('value') or "Unknown"
-                vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value') or "Unknown"
+                currency = normalized.get('currency') or extracted.get('currency', {}).get('value') or "USD"
+                
+                # Try to get vendor name - check multiple sources
+                vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value')
+                
+                # If still no vendor, try extracting from raw_text
+                if not vendor_name and inv.raw_text:
+                    from services.extractor.worker import InvoiceExtractor
+                    extractor = InvoiceExtractor()
+                    vendor_result = extractor._extract_vendor_from_text(inv.raw_text[:2000])
+                    if vendor_result and isinstance(vendor_result, dict):
+                        vendor_name = vendor_result.get('value')
+                
+                # Fallback to attachment filename
+                if not vendor_name and inv.attachments and len(inv.attachments) > 0:
+                    filename = inv.attachments[0].get('filename', '')
+                    if filename:
+                        vendor_name = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+                
+                vendor_name = vendor_name or "Unknown"
                 
                 if amount:
                     try:
@@ -218,11 +337,29 @@ def main():
                 for inv in recent_invoices:
                     extracted = inv.extracted or {}
                     normalized = inv.normalized or {}
-                    vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value') or "Unknown"
+                    
+                    # Try to get vendor name - check multiple sources
+                    vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value')
+                    
+                    # If still no vendor, try extracting from raw_text
+                    if not vendor_name and inv.raw_text:
+                        from services.extractor.worker import InvoiceExtractor
+                        extractor = InvoiceExtractor()
+                        vendor_result = extractor._extract_vendor_from_text(inv.raw_text[:2000])
+                        if vendor_result and isinstance(vendor_result, dict):
+                            vendor_name = vendor_result.get('value')
+                    
+                    # Fallback to attachment filename
+                    if not vendor_name and inv.attachments and len(inv.attachments) > 0:
+                        filename = inv.attachments[0].get('filename', '')
+                        if filename:
+                            vendor_name = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+                    
+                    vendor_name = vendor_name or "Unknown"
                     amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value')
                     attachments = inv.attachments or []
                     
-                    col1, col2, col3, col4 = st.columns([2, 2, 1, 2])
+                    col1, col2, col3 = st.columns([2, 2, 2])
                     with col1:
                         st.write(f"📄 {inv.created_at.strftime('%Y-%m-%d %H:%M')}")
                         st.caption(vendor_name)
@@ -232,9 +369,6 @@ def main():
                         else:
                             st.write("💰 N/A")
                     with col3:
-                        status_color = "🟢" if inv.reconciliation_status == "auto_matched" else "🟡" if inv.reconciliation_status == "needs_review" else "⚪"
-                        st.write(f"{status_color} {inv.reconciliation_status or 'N/A'}")
-                    with col4:
                         if attachments:
                             for att in attachments[:2]:  # Show first 2 attachments
                                 if att.get('url', '').startswith('s3://'):
@@ -299,6 +433,129 @@ def main():
                         st.rerun()
         
         with tab2:
+            st.header("📋 Itemized Invoices with Categories & BOM Numbers")
+            st.markdown("View detailed, categorized line items for each invoice with Bill of Materials (BOM) numbers.")
+            
+            # Invoice selector
+            all_invoices = db.query(Invoice).order_by(Invoice.created_at.desc()).all()
+            if not all_invoices:
+                st.info("No invoices processed yet. Sync your inbox to get started!")
+            else:
+                invoice_options = {}
+                for inv in all_invoices:
+                    extracted = inv.extracted or {}
+                    normalized = inv.normalized or {}
+                    
+                    # Try to get vendor name - check multiple sources
+                    vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value')
+                    
+                    # If still no vendor, try extracting from raw_text
+                    if not vendor_name and inv.raw_text:
+                        from services.extractor.worker import InvoiceExtractor
+                        extractor = InvoiceExtractor()
+                        vendor_result = extractor._extract_vendor_from_text(inv.raw_text[:2000])
+                        if vendor_result and isinstance(vendor_result, dict):
+                            vendor_name = vendor_result.get('value')
+                    
+                    # Fallback to attachment filename
+                    if not vendor_name and inv.attachments and len(inv.attachments) > 0:
+                        filename = inv.attachments[0].get('filename', '')
+                        if filename:
+                            # Extract vendor from filename (e.g., "BRADDOCK_SO_84839496.pdf" -> "BRADDOCK")
+                            vendor_name = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+                    
+                    vendor_name = vendor_name or "Unknown"
+                    # Prioritize date from PDF/attachment, not email date
+                    invoice_date = extracted.get('date', {}).get('value')
+                    if not invoice_date and inv.raw_text:
+                        # Try extracting date from raw_text (PDF content)
+                        from services.extractor.worker import InvoiceExtractor
+                        extractor = InvoiceExtractor()
+                        date_result = extractor.extract_field('date', inv.raw_text[:5000])
+                        if date_result and isinstance(date_result, dict):
+                            invoice_date = date_result.get('value')
+                    invoice_date = invoice_date or inv.created_at.strftime('%Y-%m-%d')
+                    invoice_num = extracted.get('invoice_number', {}).get('value') or str(inv.invoice_id)[:8]
+                    label = f"{invoice_date} - {vendor_name} - {invoice_num}"
+                    invoice_options[label] = inv.invoice_id
+                
+                selected_label = st.selectbox(
+                    "Select Invoice",
+                    options=list(invoice_options.keys()),
+                    index=0,
+                    key="invoice_selector"
+                )
+                
+                selected_invoice_id = invoice_options[selected_label]
+                selected_invoice = db.query(Invoice).filter(Invoice.invoice_id == selected_invoice_id).first()
+                
+                if selected_invoice:
+                    # Invoice header
+                    extracted = selected_invoice.extracted or {}
+                    normalized = selected_invoice.normalized or {}
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        # Try to get vendor name - check multiple sources
+                        vendor_name = normalized.get('vendor_name') or extracted.get('vendor_name', {}).get('value')
+                        
+                        # If still no vendor, try extracting from raw_text
+                        if not vendor_name and selected_invoice.raw_text:
+                            from services.extractor.worker import InvoiceExtractor
+                            extractor = InvoiceExtractor()
+                            vendor_result = extractor._extract_vendor_from_text(selected_invoice.raw_text[:2000])
+                            if vendor_result and isinstance(vendor_result, dict):
+                                vendor_name = vendor_result.get('value')
+                        
+                        # Fallback to attachment filename
+                        if not vendor_name and selected_invoice.attachments and len(selected_invoice.attachments) > 0:
+                            filename = selected_invoice.attachments[0].get('filename', '')
+                            if filename:
+                                vendor_name = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+                        
+                        vendor_name = vendor_name or "Unknown"
+                        st.metric("Vendor", vendor_name)
+                    with col2:
+                        # Prioritize date from PDF/attachment, not email date
+                        invoice_date = extracted.get('date', {}).get('value')
+                        if not invoice_date and selected_invoice.raw_text:
+                            from services.extractor.worker import InvoiceExtractor
+                            extractor = InvoiceExtractor()
+                            date_result = extractor.extract_field('date', selected_invoice.raw_text[:5000])
+                            if date_result and isinstance(date_result, dict):
+                                invoice_date = date_result.get('value')
+                        invoice_date = invoice_date or selected_invoice.created_at.strftime('%Y-%m-%d')
+                        st.metric("Date", invoice_date)
+                    with col3:
+                        total_amount = normalized.get('total_amount') or extracted.get('total_amount', {}).get('value')
+                        if total_amount:
+                            st.metric("Total Amount", f"${float(total_amount):,.2f}")
+                        else:
+                            st.metric("Total Amount", "N/A")
+                    
+                    st.divider()
+                    
+                    # Display categorized items
+                    display_categorized_items(selected_invoice)
+                    
+                    # Invoice summary
+                    line_items_data = extracted.get('line_items', {}).get('value', [])
+                    if line_items_data:
+                        total_items = len(line_items_data)
+                        categories = set(item.get('category', 'Other') for item in line_items_data)
+                        
+                        st.markdown("### 📊 Invoice Summary")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**Total Items:** {total_items}")
+                            st.write(f"**Categories:** {len(categories)}")
+                        with col2:
+                            st.write("**Categories Used:**")
+                            for cat in sorted(categories):
+                                count = sum(1 for item in line_items_data if item.get('category') == cat)
+                                st.write(f"  • {cat}: {count} items")
+        
+        with tab3:
             st.header("💬 AI Document Assistant")
             st.markdown("Ask questions about any content in your PDFs. The AI analyzes all documents and provides clear answers.")
             
@@ -425,7 +682,7 @@ def main():
             elif ask_button and not query_text:
                 st.warning("Please enter a question first")
         
-        with tab3:
+        with tab4:
             st.header("📎 All Attachments")
             
             # Get all invoices with attachments
@@ -460,7 +717,7 @@ def main():
                     
                     st.divider()
         
-        with tab4:
+        with tab5:
             st.header("📧 Process New Emails")
             
             # Sync Inbox section (for receipts-only account)
